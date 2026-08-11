@@ -28,6 +28,7 @@ jsonptr.workspace = true
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
 parking_lot.workspace = true
 rand.workspace = true
+regex.workspace = true
 switchyard-protocol.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -36,6 +37,8 @@ tracing.workspace = true
 tracing-opentelemetry.workspace = true
 
 [dev-dependencies]
+# HeaderMap construction for budget-scope tests.
+http.workspace = true
 # SDK + in-memory exporter to assert what the observability layer records.
 opentelemetry_sdk = { version = "0.32", features = ["metrics", "testing", "trace"] }
 tokio.workspace = true
