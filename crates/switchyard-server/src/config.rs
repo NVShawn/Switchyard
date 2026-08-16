@@ -20,7 +20,7 @@ use switchyard_llm_client::{
     Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
     TranslatingLlmClient,
 };
-use switchyard_protocol::{ModelId, RoutedLlmClient};
+use switchyard_protocol::{ModelId, RoutedLlmClient, TargetCost};
 use switchyard_translation::TargetCapabilities;
 
 use crate::{
@@ -80,6 +80,18 @@ impl ServerConfig {
         for (target_name, target) in &self.targets {
             validate_value("target name", target_name)?;
             validate_value(&format!("target {target_name} id"), &target.id)?;
+            if let Some(cost) = &target.cost {
+                for (price, label) in [
+                    (cost.input_per_1m, "input_per_1m"),
+                    (cost.output_per_1m, "output_per_1m"),
+                ] {
+                    if !price.is_finite() || price < 0.0 {
+                        return Err(ServerError::new(format!(
+                            "target {target_name} cost {label} must be a non-negative finite number"
+                        )));
+                    }
+                }
+            }
             if !seen_client_model_ids.insert((target.llm_client.as_str(), target.id.as_str())) {
                 tracing::warn!(
                     "target {target_name} reuses model id {} on llm client {}; only one target per id is kept and the other is dropped. Give each target a unique model id, or point both routes at one target.",
@@ -273,6 +285,8 @@ struct TargetConfig {
     extra_body: BTreeMap<String, Value>,
     #[serde(default)]
     capabilities: TargetCapabilities,
+    #[serde(default)]
+    cost: Option<TargetCost>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -1478,6 +1492,40 @@ target = "azure"
         );
         server_state_from_toml(&configured)?;
         Ok(())
+    }
+
+#[test]
+    fn target_cost_is_parsed_when_configured() -> ServerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "llm_client = \"primary\"",
+            "llm_client = \"primary\"\ncost = { input_per_1m = 0.5, output_per_1m = 2.0 }",
+            1,
+        );
+        let config: ServerConfig = toml::from_str(&configured)
+            .map_err(|error| ServerError::new(format!("failed to parse config: {error}")))?;
+        let Some(target) = config.targets.get("classifier") else {
+            return Err(ServerError::new("classifier target is missing"));
+        };
+        assert_eq!(
+            target.cost,
+            Some(TargetCost {
+                input_per_1m: 0.5,
+                output_per_1m: 2.0,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn target_cost_rejects_negative_prices() {
+        assert!(
+            error_message(&VALID_CONFIG.replacen(
+                "llm_client = \"primary\"",
+                "llm_client = \"primary\"\ncost = { input_per_1m = -0.5, output_per_1m = 1.0 }",
+                1,
+            ))
+            .contains("cost input_per_1m must be a non-negative finite number")
+        );
     }
 
     #[test]

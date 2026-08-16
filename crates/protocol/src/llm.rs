@@ -400,6 +400,44 @@ impl Usage {
             .get_or_insert_with(|| Box::new(InputCacheUsage::default()))
             .cache_creation_input_tokens = Some(value);
     }
+
+    /// Every reported input token: non-cached, cache-read, and cache-written.
+    fn total_input_tokens(&self) -> Option<u64> {
+        let input = self.input_tokens?;
+        Some(
+            input
+                + self.cached_input_tokens().unwrap_or(0)
+                + self.cache_creation_input_tokens().unwrap_or(0),
+        )
+    }
+}
+
+/// Provider-neutral unit pricing for one target, stated per 1M tokens.
+///
+/// The same USD units a cost-aware router compares: a target priced
+/// `input = 0.15, output = 0.60` costs $0.15 per 1M prompt tokens.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct TargetCost {
+    /// USD per 1M input tokens, including cached input at the same rate.
+    pub input_per_1m: f64,
+    /// USD per 1M output tokens.
+    pub output_per_1m: f64,
+}
+
+impl TargetCost {
+    /// Estimated USD spent by a completed call, from provider-reported usage.
+    ///
+    /// Bills all reported input tokens (non-cached, cache-read, and
+    /// cache-written) at the input price and output tokens at the output price.
+    /// Returns `None` when usage carries no token counts to price.
+    pub fn estimate_usd(&self, usage: &Usage) -> Option<f64> {
+        let input = usage.total_input_tokens()?;
+        let output = usage.output_tokens?;
+        Some(
+            input as f64 / 1_000_000.0 * self.input_per_1m
+                + output as f64 / 1_000_000.0 * self.output_per_1m,
+        )
+    }
 }
 
 /// Normalized reason a model stopped producing output.
@@ -489,5 +527,55 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    #[test]
+    fn cost_estimates_usd_from_reported_usage() {
+        let cost = TargetCost {
+            input_per_1m: 0.5,
+            output_per_1m: 2.0,
+        };
+        let usage = Usage {
+            input_tokens: Some(1_000_000),
+            cache: None,
+            output_tokens: Some(500_000),
+            total_tokens: Some(1_500_000),
+            reasoning_tokens: None,
+        };
+        assert_eq!(cost.estimate_usd(&usage), Some(0.5 + 1.0));
+
+        // Cached input is billed at the input rate too.
+        let cached = Usage {
+            input_tokens: Some(100_000),
+            cache: Usage::cache_details(Some(50_000), Some(10_000)),
+            output_tokens: Some(0),
+            total_tokens: Some(160_000),
+            reasoning_tokens: None,
+        };
+        assert_eq!(
+            cost.estimate_usd(&cached),
+            Some((100_000.0 + 50_000.0 + 10_000.0) / 1_000_000.0 * 0.5)
+        );
+    }
+
+    #[test]
+    fn cost_returns_none_without_usage_details() {
+        let cost = TargetCost {
+            input_per_1m: 0.5,
+            output_per_1m: 2.0,
+        };
+        for usage in [
+            Usage::default(),
+            Usage {
+                input_tokens: Some(1000),
+                ..Default::default()
+            },
+            Usage {
+                output_tokens: Some(1000),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(cost.estimate_usd(&usage), None);
+        }
     }
 }
