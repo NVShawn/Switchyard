@@ -54,6 +54,35 @@ The serving process only needs the log on the volume; the dream step only needs
 to read that file and, for re-judging, reach an OpenAI-compatible model
 (`--api-key` or `OPENAI_API_KEY`).
 
+### Concrete single-host example
+
+The `deploy/docker-compose.yml` in this repository is a standalone serving
+deployment built for exactly this split. It serves `routes.toml` on port 4000
+and appends the routing log to a bind-mounted host directory (`deploy/data`
+unless `SWITCHYARD_DATA_DIR` overrides it), so the dream step reads the same
+file the container writes:
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d --build
+uv run switchyard dream --log deploy/data/routing.jsonl \
+  --strong-model nvidia/nvidia/nemotron-3-ultra \
+  --base-url https://inference-api.nvidia.com/v1
+```
+
+### Picking up post-dream data without a restart
+
+The serving process has no restart requirement to see a growing log:
+
+- Bandit-enabled routes re-aggregate arm priors from the log on a five-minute
+  interval, with the first pass on startup. Records appended to the shared file
+  (new traffic, or a log the dream step was analyzing) feed the sampler without
+  a restart.
+- Per-session stats (`GET /v1/routing/session-stats`) rescan the log on demand.
+
+Dream itself is read-only on the log. Its `--out` label file is for offline
+fine-tuning, not something the serving process ingests; changing routing
+behavior from dream output is not part of the current feature surface.
+
 ## Related Documentation
 
 - [Context-Window Handling](context_window.md)
