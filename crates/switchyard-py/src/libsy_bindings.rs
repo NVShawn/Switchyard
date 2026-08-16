@@ -440,6 +440,7 @@ fn llm_task_classifier_algorithm(
         efficient_target: ModelId::new(efficient_target),
         capable_target: ModelId::new(capable_target),
         capability_targets: Vec::new(),
+        capability_zones: None,
         config: config.bind(py).try_borrow()?.clone_core(),
     })
     .map_err(|error| PyValueError::new_err(error.to_string()))?;

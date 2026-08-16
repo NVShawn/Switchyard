@@ -186,6 +186,7 @@ fn build_route(
                 efficient_target: efficient,
                 capable_target: capable,
                 capability_targets: Vec::new(),
+                capability_zones: None,
                 config: fallback.config,
             })?),
             source: DecisionSource::LlmClassifier,

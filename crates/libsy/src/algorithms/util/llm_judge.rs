@@ -221,6 +221,12 @@ where
         }
     }
 
+    /// The verdict policy, for a wrapper that needs to route from a verdict it
+    /// already holds rather than re-consulting the judge.
+    pub(crate) fn policy(&self) -> &P {
+        &self.policy
+    }
+
     /// Consults the judge, yielding `None` when it is unavailable or unintelligible.
     ///
     /// A judge is an optimization, not a dependency: failing the caller's request because the
@@ -228,7 +234,7 @@ where
     /// mid-stream, or unparseable reply — is logged and folded into `None` for the policy's
     /// fallback branch. A closed driver stream is folded too; the algorithm's next driver
     /// call surfaces it, so nothing is masked.
-    async fn verdict(
+    pub(crate) async fn verdict(
         &self,
         state: &mut State,
         request: &Request,
@@ -322,7 +328,7 @@ where
     }
 }
 
-fn parse_json_verdict<T: DeserializeOwned>(response: &AggLlmResponse) -> Result<T> {
+pub(crate) fn parse_json_verdict<T: DeserializeOwned>(response: &AggLlmResponse) -> Result<T> {
     // Providers sometimes wrap otherwise valid JSON in a Markdown fence.
     let reply = completion_text(response);
     serde_json::from_str(strip_json_fence(reply.trim())).map_err(|err| LibsyError::AlgorithmError {

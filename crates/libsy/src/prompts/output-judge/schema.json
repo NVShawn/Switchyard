@@ -1,0 +1,27 @@
+{
+  "type": "json_schema",
+  "json_schema": {
+    "name": "CandidateComparisonDecision",
+    "strict": true,
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "winner",
+        "reason"
+      ],
+      "properties": {
+        "winner": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "0-based index of the best candidate answer."
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the winning candidate is the most correct and complete."
+        }
+      }
+    }
+  }
+}

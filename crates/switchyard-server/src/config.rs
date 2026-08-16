@@ -323,6 +323,22 @@ struct CapabilityTargetConfig {
     capability: f64,
 }
 
+/// Confidence-zone and fan-out settings for a capability ladder (`[routes.x.zones]`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ZoneConfigToml {
+    low_threshold: f64,
+    high_threshold: f64,
+    fan_out: usize,
+    output_judge_target: String,
+    #[serde(default)]
+    output_judge_prompt: Option<String>,
+    #[serde(default)]
+    output_judge_response_format_type: ClassifierResponseFormat,
+    #[serde(default = "default_classifier_max_output_tokens")]
+    output_judge_max_output_tokens: u64,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ClassifierMode {
@@ -360,6 +376,8 @@ struct CapabilityClassifierRouteConfig {
     max_output_tokens: u64,
     /// Cost-ascending capability ladder; empty selects the binary strong/weak policy.
     capability_targets: Vec<CapabilityTargetConfig>,
+    /// Confidence zones and fan-out; only valid with a capability ladder.
+    zones: Option<ZoneConfigToml>,
 }
 
 #[derive(Debug)]
@@ -463,6 +481,9 @@ enum RouteConfig {
         /// Cost-ascending capability ladder for cost-aware capability routing.
         #[serde(default)]
         capability_targets: Option<Vec<CapabilityTargetConfig>>,
+        /// Confidence zones and fan-out for a capability ladder.
+        #[serde(default)]
+        zones: Option<ZoneConfigToml>,
     },
     StageRouter {
         id: ModelId,
@@ -597,8 +618,16 @@ impl RouteConfig {
         let mut names = self.routing_target_names();
         match self {
             Self::LlmClassifier {
-                classifier_target, ..
-            } => names.push(classifier_target),
+                classifier_target,
+                zones,
+                ..
+            } => {
+                names.push(classifier_target);
+                // The fan-out output judge is called too, so its target needs a client.
+                if let Some(zones) = zones {
+                    names.push(zones.output_judge_target.as_str());
+                }
+            }
             Self::StageRouter {
                 classifier: Some(classifier),
                 ..
@@ -667,6 +696,7 @@ impl RouteConfig {
             response_schema,
             policy,
             capability_targets,
+            zones,
             ..
         } = self
         else {
@@ -737,6 +767,26 @@ impl RouteConfig {
                         })?,
                     )
                 };
+                if let Some(zone) = zones {
+                    if capability_targets.is_empty() {
+                        return Err(ServerError::new(format!(
+                            "llm_classifier route {route_name} zones requires capability_targets"
+                        )));
+                    }
+                    if !(0.0..=1.0).contains(&zone.low_threshold)
+                        || !(0.0..=1.0).contains(&zone.high_threshold)
+                        || zone.low_threshold > zone.high_threshold
+                    {
+                        return Err(ServerError::new(format!(
+                            "llm_classifier route {route_name} zones must satisfy 0 <= low_threshold <= high_threshold <= 1"
+                        )));
+                    }
+                    if zone.fan_out == 0 {
+                        return Err(ServerError::new(format!(
+                            "llm_classifier route {route_name} zones fan_out must be at least 1"
+                        )));
+                    }
+                }
                 Ok(LlmClassifierModeConfig::Capability(
                     CapabilityClassifierRouteConfig {
                         strong_target,
@@ -754,6 +804,7 @@ impl RouteConfig {
                         response_format_type: *response_format_type,
                         max_output_tokens: *max_output_tokens,
                         capability_targets,
+                        zones: zones.clone(),
                     },
                 ))
             }
@@ -772,6 +823,9 @@ impl RouteConfig {
                         "capability_targets",
                         "escalation",
                     ));
+                }
+                if zones.is_some() {
+                    return Err(classifier_field_error(route_name, "zones", "escalation"));
                 }
                 if mode.is_some()
                     && (base_threshold.is_some()
@@ -810,6 +864,7 @@ impl RouteConfig {
                     || threshold_step.is_some()
                     || escalation.is_some()
                     || capability_targets.is_some()
+                    || zones.is_some()
                     || *response_format_type != ClassifierResponseFormat::JsonSchema
                 {
                     return Err(ServerError::new(format!(
@@ -1002,6 +1057,32 @@ fn build_algorithm(
                             })
                         })
                         .collect::<ServerResult<Vec<_>>>()?;
+                    // Build the confidence zones and their output judge, when configured.
+                    let capability_zones = config
+                        .zones
+                        .as_ref()
+                        .map(|zone| {
+                            let output_judge_target = resolve_target_model_id(
+                                route_name,
+                                &zone.output_judge_target,
+                                targets,
+                            )?;
+                            let output_judge_contract =
+                                classifier_contract(zone.output_judge_prompt.as_deref())
+                                    .with_response_format_type(
+                                        zone.output_judge_response_format_type,
+                                    );
+                            Ok(libsy::ZoneConfig {
+                                low_threshold: zone.low_threshold,
+                                high_threshold: zone.high_threshold,
+                                fan_out: zone.fan_out,
+                                output_judge_target,
+                                output_judge_contract,
+                                output_judge_max_output_tokens: zone
+                                    .output_judge_max_output_tokens,
+                            })
+                        })
+                        .transpose()?;
                     let classifier_config = TaskClassifierConfig {
                         base_threshold: config.base_threshold,
                         threshold_step: config.threshold_step,
@@ -1017,6 +1098,7 @@ fn build_algorithm(
                         efficient_target: weak,
                         capable_target: strong,
                         capability_targets,
+                        capability_zones,
                         config: classifier_config,
                     })
                 }
@@ -1433,6 +1515,70 @@ capability_targets = [
                 .contains("mode custom cannot use capability or escalation fields")
         );
     }
+
+    /// The ladder with a `[routes.ladder.zones]` fan-out table appended.
+    fn zoned_ladder() -> String {
+        format!(
+            r#"{LADDER_CONFIG}
+[routes.ladder.zones]
+low_threshold = 0.3
+high_threshold = 0.7
+fan_out = 3
+output_judge_target = "judge"
+"#
+        )
+    }
+
+    #[test]
+    fn a_capability_ladder_with_zones_builds_fan_out_routing() -> ServerResult<()> {
+        let state = server_state_from_toml(&zoned_ladder())?;
+        assert_eq!(state.models().collect::<Vec<_>>(), ["switchyard/ladder"]);
+        Ok(())
+    }
+
+
+    #[test]
+    fn zones_require_a_capability_ladder() {
+        // Zones on the binary strong/weak route have no ladder to fan out over.
+        let zones_without_ladder = format!(
+            r#"{VALID_CONFIG}
+[routes.classifier.zones]
+low_threshold = 0.3
+high_threshold = 0.7
+fan_out = 2
+output_judge_target = "classifier"
+"#
+        );
+        assert!(error_message(&zones_without_ladder).contains("zones requires capability_targets"));
+    }
+
+
+    #[test]
+    fn zones_reject_inverted_thresholds_and_zero_fan_out() {
+        let inverted = zoned_ladder().replace("low_threshold = 0.3", "low_threshold = 0.9");
+        assert!(error_message(&inverted).contains("0 <= low_threshold <= high_threshold <= 1"));
+
+        let zero_fan_out = zoned_ladder().replace("fan_out = 3", "fan_out = 0");
+        assert!(error_message(&zero_fan_out).contains("fan_out must be at least 1"));
+    }
+
+
+    #[test]
+    fn zones_are_rejected_in_escalation_mode() {
+        let escalation = VALID_CONFIG.replace(
+            "base_threshold = 0.5",
+            "base_threshold = 0.5\nescalation = { confirmations = 2 }",
+        ) + r#"
+[routes.classifier.zones]
+low_threshold = 0.3
+high_threshold = 0.7
+fan_out = 2
+output_judge_target = "classifier"
+"#;
+        assert!(error_message(&escalation).contains("mode escalation cannot use zones"));
+    }
+
+
 
 
     #[test]

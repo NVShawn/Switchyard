@@ -27,10 +27,16 @@ use crate::core::algorithm::{self, Algorithm, Driver};
 use crate::core::classifier::{Classification, Classifier, Score};
 use crate::core::state::{State, StateValue};
 use crate::{LibsyError, Result};
-use switchyard_protocol::{AggLlmResponse, LlmClientError, LlmResponse, Request, Response};
+use switchyard_protocol::{
+    AggLlmResponse, InstructionBlock, LlmClientError, LlmRequest, LlmResponse, OutputParams,
+    Request, Response,
+};
 
 const PROMPT_TEMPLATE: &str = include_str!("../prompts/capability-classifier/prompt.md");
 const SCHEMA_TEMPLATE: &str = include_str!("../prompts/capability-classifier/schema.json");
+/// Output judge prompt and verdict contract for Zone B fan-out comparison.
+const COMPARE_PROMPT_TEMPLATE: &str = include_str!("../prompts/output-judge/prompt.md");
+const COMPARE_SCHEMA_TEMPLATE: &str = include_str!("../prompts/output-judge/schema.json");
 /// Telemetry label for this algorithm's spans, metrics, and logs.
 const ALGORITHM_NAME: &str = "llm_task_classifier";
 
@@ -556,6 +562,331 @@ struct TaskClassifier {
     capable_target: ModelId,
 }
 
+// ── Cost-aware classifier (capability ladder + confidence zones) ─────────────
+
+/// The output judge's pick among the fanned-out candidate answers.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompareVerdict {
+    winner: usize,
+    /// Stating the case sharpens the verdict; routing reads only the index.
+    #[allow(dead_code)]
+    reason: String,
+}
+
+/// Confidence-zone and fan-out settings for cost-aware routing.
+///
+/// Zones partition the judge's `p_solve`: high confidence answers with a single
+/// cheapest-adequate call (Zone A), low confidence routes straight to the most
+/// capable rung (Zone C), and the mid band fans out to several rungs and lets an
+/// output judge pick the best answer (Zone B). Fan-out is the explicit price of
+/// uncertainty: Zone B spends `fan_out` answer calls plus one judge call.
+#[derive(Clone, Debug)]
+pub struct ZoneConfig {
+    /// `p_solve` at or above this answers with one cheapest-adequate call (Zone A).
+    pub high_threshold: f64,
+    /// `p_solve` below this routes straight to the most capable rung (Zone C).
+    pub low_threshold: f64,
+    /// How many eligible rungs Zone B calls concurrently before judging their answers.
+    pub fan_out: usize,
+    /// Target that judges the fanned-out candidate answers.
+    pub output_judge_target: ModelId,
+    /// Prompt and verdict contract settings for the output judge.
+    pub output_judge_contract: ClassifierContractConfig,
+    /// Maximum completion tokens available to the output judge verdict.
+    pub output_judge_max_output_tokens: u64,
+}
+
+impl ZoneConfig {
+    fn validate(&self) -> Result<()> {
+        if !(0.0..=1.0).contains(&self.low_threshold) || !(0.0..=1.0).contains(&self.high_threshold)
+        {
+            return Err(LibsyError::AlgorithmError {
+                message: format!(
+                    "zone thresholds must be between 0 and 1, got low {} high {}",
+                    self.low_threshold, self.high_threshold
+                ),
+            });
+        }
+        if self.low_threshold > self.high_threshold {
+            return Err(LibsyError::AlgorithmError {
+                message: format!(
+                    "zone low_threshold {} must not exceed high_threshold {}",
+                    self.low_threshold, self.high_threshold
+                ),
+            });
+        }
+        if self.fan_out == 0 {
+            return Err(LibsyError::AlgorithmError {
+                message: "zone fan_out must be at least 1".to_string(),
+            });
+        }
+        if self.output_judge_max_output_tokens == 0 {
+            return Err(LibsyError::AlgorithmError {
+                message: "output judge max_output_tokens must be at least 1".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Zone boundaries with the output-judge contract compiled, ready to serve.
+struct ZoneRuntime {
+    low_threshold: f64,
+    high_threshold: f64,
+    fan_out: usize,
+    output_judge_target: ModelId,
+    output_contract: ClassifierContract,
+    output_max_output_tokens: u64,
+}
+
+impl ZoneConfig {
+    fn build_runtime(&self) -> Result<ZoneRuntime> {
+        self.validate()?;
+        let output_contract = ClassifierContract::from_config(
+            &self.output_judge_contract,
+            COMPARE_PROMPT_TEMPLATE,
+            COMPARE_SCHEMA_TEMPLATE,
+        )?;
+        Ok(ZoneRuntime {
+            low_threshold: self.low_threshold,
+            high_threshold: self.high_threshold,
+            fan_out: self.fan_out,
+            output_judge_target: self.output_judge_target.clone(),
+            output_contract,
+            output_max_output_tokens: self.output_judge_max_output_tokens,
+        })
+    }
+}
+
+/// Which zone a validated verdict falls into.
+enum Zone {
+    /// High confidence: one cheapest-adequate call.
+    Answer,
+    /// Low confidence or an unsupported boundary: the most capable rung.
+    Capable,
+    /// Mid confidence: fan out and judge the candidates' answers.
+    FanOut,
+}
+
+/// Routes among a cost-ascending capability ladder, optionally fanning out over the
+/// mid-confidence zone and judging the candidates' answers with an output judge.
+struct CostAwareClassifier {
+    classifier: JudgeClassifier<CapabilityJudge, TaskClassifierPolicy>,
+    /// Cost-ascending capability ladder.
+    ranked: Vec<CapabilityTarget>,
+    /// The most capable rung: Zone C's target and the cascade's fallback.
+    capable_target: ModelId,
+    zones: Option<ZoneRuntime>,
+}
+
+#[async_trait]
+impl Classifier<State> for CostAwareClassifier {
+    async fn score(
+        &self,
+        state: &mut State,
+        request: &mut Request,
+        driver: Option<&Driver>,
+    ) -> Result<(Classification, Option<Response>)> {
+        let Some(driver) = driver else {
+            return Err(LibsyError::AlgorithmError {
+                message: "cost-aware classifier requires a driver".to_string(),
+            });
+        };
+        let verdict = self.classifier.verdict(state, request, driver).await;
+        let Some(verdict) = verdict.filter(|verdict| verdict.is_valid()) else {
+            return Ok((Classification::Ambiguous(vec![]), None));
+        };
+        let Some(zones) = &self.zones else {
+            // No zones: the ranked pick is the whole decision, a single call.
+            return Ok((
+                self.classifier.policy().to_classification(Some(&verdict)),
+                None,
+            ));
+        };
+        match Self::zone(&verdict, zones) {
+            Zone::Answer => Ok((
+                self.classifier.policy().to_classification(Some(&verdict)),
+                None,
+            )),
+            Zone::Capable => Ok((decisive(&self.capable_target), None)),
+            Zone::FanOut => self.fan_out(request, driver, &verdict, zones).await,
+        }
+    }
+}
+
+impl CostAwareClassifier {
+    /// Maps a validated verdict to its zone. An unsupported boundary is always Zone C:
+    /// the judge already distrusts the cheap tiers, whatever p_solve says.
+    fn zone(verdict: &TaskClassifierVerdict, zones: &ZoneRuntime) -> Zone {
+        if verdict.capability_boundary == "unsupported" {
+            return Zone::Capable;
+        }
+        if verdict.p_solve >= zones.high_threshold {
+            Zone::Answer
+        } else if verdict.p_solve < zones.low_threshold {
+            Zone::Capable
+        } else {
+            Zone::FanOut
+        }
+    }
+
+    /// Zone B: call the cheapest eligible rungs concurrently, buffer their answers, and
+    /// return the output judge's pick. The losers' cost is the price of uncertainty.
+    async fn fan_out(
+        &self,
+        request: &mut Request,
+        driver: &Driver,
+        verdict: &TaskClassifierVerdict,
+        zones: &ZoneRuntime,
+    ) -> Result<(Classification, Option<Response>)> {
+        // Eligible rungs clear the judged level, cheapest first; without a level the
+        // whole ladder is eligible. The ladder is already cost-ordered.
+        let eligible: Vec<&CapabilityTarget> = match verdict.minimum_capability {
+            Some(required) => self
+                .ranked
+                .iter()
+                .filter(|rung| rung.capability >= required)
+                .collect(),
+            None => self.ranked.iter().collect(),
+        };
+        let candidates: Vec<&CapabilityTarget> = eligible.into_iter().take(zones.fan_out).collect();
+        match candidates.len() {
+            // No rung clears the level: this is Zone C's job, not a fan-out.
+            0 => return Ok((decisive(&self.capable_target), None)),
+            // One rung needs no judge and no second call.
+            1 => {
+                return Ok((decisive(&candidates[0].target), None));
+            }
+            _ => {}
+        }
+
+        // Call the candidates concurrently; the driver serves them in parallel.
+        let results = futures::future::join_all(
+            candidates
+                .iter()
+                .map(|rung| driver.call_model(request.clone(), vec![rung.target.clone()], true)),
+        )
+        .await;
+
+        // Buffer the answers that came back; a failed or unbufferable candidate drops out.
+        let stream = request.llm_request.stream;
+        let mut buffered: Vec<(
+            ModelId,
+            AggLlmResponse,
+            Option<switchyard_protocol::Metadata>,
+        )> = Vec::new();
+        for (rung, result) in candidates.iter().zip(results) {
+            let Ok(response) = result else { continue };
+            let Response {
+                llm_response,
+                metadata,
+            } = response;
+            match llm_response.into_agg().await {
+                Ok(aggregate) => buffered.push((rung.target.clone(), aggregate, metadata)),
+                Err(_) => continue,
+            }
+        }
+        match buffered.len() {
+            // Every candidate failed: abstain so the cascade's fallback decides.
+            0 => return Ok((Classification::Ambiguous(vec![]), None)),
+            // A lone survivor needs no comparison.
+            1 => {
+                return match buffered.into_iter().next() {
+                    Some((target, aggregate, metadata)) => Ok((
+                        decisive(&target),
+                        Some(into_response(aggregate, metadata, stream)),
+                    )),
+                    None => Ok((Classification::Ambiguous(vec![]), None)),
+                };
+            }
+            _ => {}
+        }
+
+        // Ask the output judge which candidate answer is best. A judge failure or an
+        // out-of-range index falls back to the cheapest candidate, already paid for.
+        let candidate_texts: Vec<String> = buffered
+            .iter()
+            .map(|(_, aggregate, _)| switchyard_protocol::completion_text(aggregate))
+            .collect();
+        let compare_request = Self::compare_request(request, &candidate_texts, zones);
+        let winner = match driver
+            .call_model(
+                compare_request,
+                vec![zones.output_judge_target.clone()],
+                false,
+            )
+            .await
+        {
+            Ok(response) => match response.llm_response.into_agg().await {
+                Ok(aggregate) => {
+                    super::util::llm_judge::parse_json_verdict::<CompareVerdict>(&aggregate)
+                        .ok()
+                        .filter(|verdict| verdict.winner < buffered.len())
+                        .map(|verdict| verdict.winner)
+                }
+                Err(_) => None,
+            },
+            Err(_) => None,
+        }
+        .unwrap_or(0);
+
+        let (target, aggregate, metadata) = buffered.swap_remove(winner);
+        Ok((
+            decisive(&target),
+            Some(into_response(aggregate, metadata, stream)),
+        ))
+    }
+
+    /// Builds the output-judge request: the trimmed task, then the numbered candidates.
+    fn compare_request(request: &Request, candidates: &[String], zones: &ZoneRuntime) -> Request {
+        let mut messages = task_messages(&request.llm_request.messages);
+        let mut comparison = String::from("Candidate answers, numbered from 0:\n");
+        for (index, candidate) in candidates.iter().enumerate() {
+            comparison.push_str(&format!("\n--- candidate {index} ---\n{candidate}\n"));
+        }
+        messages.push(Message::text(Role::User, comparison));
+        Request {
+            llm_request: LlmRequest {
+                model: request.llm_request.model.clone(),
+                instructions: vec![InstructionBlock {
+                    role: Role::System,
+                    content: Message::text(
+                        Role::System,
+                        zones.output_contract.system_prompt().to_string(),
+                    )
+                    .content,
+                }],
+                messages,
+                output: OutputParams {
+                    max_output_tokens: Some(zones.output_max_output_tokens),
+                    response_format: Some(zones.output_contract.response_format().clone()),
+                },
+                ..LlmRequest::default()
+            },
+            raw_request: None,
+            metadata: request.metadata.clone(),
+        }
+    }
+}
+
+/// Rebuilds a buffered candidate answer into a response, re-streaming it when the
+/// caller asked for a stream.
+fn into_response(
+    aggregate: AggLlmResponse,
+    metadata: Option<switchyard_protocol::Metadata>,
+    stream: bool,
+) -> Response {
+    Response {
+        llm_response: if stream {
+            LlmResponse::Stream(aggregate.into_stream())
+        } else {
+            LlmResponse::Agg(aggregate)
+        },
+        metadata,
+    }
+}
+
 // ── Escalation classifier ──────────────────────────────────────────────────
 
 /// Session-state key holding the consecutive-escalate streak.
@@ -728,6 +1059,9 @@ pub enum LlmClassifierConfig {
         /// the judge's `minimum_capability`.
         #[doc = ""]
         capability_targets: Vec<CapabilityTarget>,
+        /// Confidence zones and fan-out. Only valid with a `capability_targets` ladder;
+        /// `None` makes every ranked pick a single call.
+        capability_zones: Option<ZoneConfig>,
         /// Capability classifier settings.
         config: TaskClassifierConfig,
     },
@@ -773,12 +1107,14 @@ impl LlmTaskClassifier {
                 efficient_target,
                 capable_target,
                 capability_targets,
+                capability_zones,
                 config,
             } => Self::build_capability(
                 judge_target,
                 efficient_target,
                 capable_target,
                 capability_targets,
+                capability_zones,
                 config,
             ),
             LlmClassifierConfig::Escalation {
@@ -810,9 +1146,16 @@ impl LlmTaskClassifier {
         efficient_target: ModelId,
         capable_target: ModelId,
         capability_targets: Vec<CapabilityTarget>,
+        capability_zones: Option<ZoneConfig>,
         config: TaskClassifierConfig,
     ) -> Result<Self> {
         config.validate()?;
+        // Zones need a ladder to fan out over; they are meaningless for the binary pair.
+        if capability_zones.is_some() && capability_targets.is_empty() {
+            return Err(LibsyError::AlgorithmError {
+                message: "capability_zones requires a capability_targets ladder".to_string(),
+            });
+        }
         // Validate and order the ladder cheapest-first. An empty ladder keeps the binary
         // efficient/capable policy; one rung is not a ladder, so reject it.
         let ranked = if capability_targets.is_empty() {
@@ -839,17 +1182,28 @@ impl LlmTaskClassifier {
             });
             ranked
         };
+        let zones = capability_zones
+            .map(|zones| zones.build_runtime())
+            .transpose()?;
         let contract = Self::load_capability_contract(&config.contract)?;
-        let targets = if ranked.is_empty() {
-            vec![efficient_target.clone(), capable_target.clone()]
-        } else {
-            ranked.iter().map(|rung| rung.target.clone()).collect()
-        };
+        let session_affinity = config.session_affinity;
+        let message_hash_fallback = config.message_hash_fallback;
+        let judge_classifier = JudgeClassifier::new(
+            StructuredJudge::new(
+                TaskInput {
+                    recent_turn_window: config.recent_turn_window,
+                },
+                contract,
+                SerdeDecoder::new(),
+                JudgeRuntimeConfig::new(config.max_output_tokens)?,
+            ),
+            judge_target.clone(),
+            TaskClassifierPolicy::new(efficient_target.clone(), capable_target.clone(), &config)
+                .with_ranked_targets(ranked.clone()),
+        );
         // The cascade's last-resort target is the strongest rung on a ladder, else the
         // capable tier as before.
-        let default_target = if ranked.is_empty() {
-            capable_target.clone()
-        } else {
+        let most_capable = |ranked: &[CapabilityTarget]| {
             ranked
                 .iter()
                 .max_by(|a, b| {
@@ -860,30 +1214,30 @@ impl LlmTaskClassifier {
                 .map(|rung| rung.target.clone())
                 .unwrap_or_else(|| capable_target.clone())
         };
-        let session_affinity = config.session_affinity;
-        let message_hash_fallback = config.message_hash_fallback;
-        let classifier = Arc::new(TaskClassifier {
-            classifier: JudgeClassifier::new(
-                StructuredJudge::new(
-                    TaskInput {
-                        recent_turn_window: config.recent_turn_window,
-                    },
-                    contract,
-                    SerdeDecoder::new(),
-                    JudgeRuntimeConfig::new(config.max_output_tokens)?,
-                ),
-                judge_target.clone(),
-                TaskClassifierPolicy::new(
-                    efficient_target.clone(),
+        let (targets, default_target, inner): (Vec<ModelId>, ModelId, Arc<dyn Classifier<State>>) =
+            if ranked.is_empty() {
+                (
+                    vec![efficient_target.clone(), capable_target.clone()],
                     capable_target.clone(),
-                    &config,
+                    Arc::new(TaskClassifier {
+                        classifier: judge_classifier,
+                        efficient_target: efficient_target.clone(),
+                        capable_target: capable_target.clone(),
+                    }),
                 )
-                .with_ranked_targets(ranked),
-            ),
-            efficient_target: efficient_target.clone(),
-            capable_target: capable_target.clone(),
-        });
-        let inner: Arc<dyn Classifier<State>> = classifier.clone();
+            } else {
+                let default = most_capable(&ranked);
+                (
+                    ranked.iter().map(|rung| rung.target.clone()).collect(),
+                    default.clone(),
+                    Arc::new(CostAwareClassifier {
+                        classifier: judge_classifier,
+                        ranked,
+                        capable_target: default,
+                        zones,
+                    }),
+                )
+            };
         Self::from_classifier(
             targets,
             inner,
@@ -1273,6 +1627,7 @@ mod tests {
                 efficient_target: ModelId::from("efficient"),
                 capable_target: ModelId::from("capable"),
                 capability_targets: Vec::new(),
+                capability_zones: None,
                 config: test_config(TEST_THRESHOLD),
             },
         )?))
@@ -1359,6 +1714,7 @@ mod tests {
             efficient_target: ModelId::from("efficient"),
             capable_target: ModelId::from("capable"),
             capability_targets: Vec::new(),
+            capability_zones: None,
             config: TaskClassifierConfig {
                 max_output_tokens: 512,
                 ..test_config(TEST_THRESHOLD)
@@ -1379,6 +1735,7 @@ mod tests {
             efficient_target: ModelId::from("efficient"),
             capable_target: ModelId::from("capable"),
             capability_targets: Vec::new(),
+            capability_zones: None,
             config: TaskClassifierConfig {
                 contract: ClassifierContractConfig::default()
                     .with_prompt("Custom capability rubric."),
@@ -1402,6 +1759,7 @@ mod tests {
             efficient_target: ModelId::from("efficient"),
             capable_target: ModelId::from("capable"),
             capability_targets: Vec::new(),
+            capability_zones: None,
             config: TaskClassifierConfig {
                 session_affinity: true,
                 ..test_config(TEST_THRESHOLD)
@@ -1424,6 +1782,7 @@ mod tests {
             efficient_target: ModelId::from("efficient"),
             capable_target: ModelId::from("capable"),
             capability_targets: Vec::new(),
+            capability_zones: None,
             config: TaskClassifierConfig {
                 session_affinity: true,
                 message_hash_fallback: true,
@@ -1489,7 +1848,8 @@ mod tests {
                     efficient_target: ModelId::from("e"),
                     capable_target: ModelId::from("c"),
                     capability_targets: Vec::new(),
-                    config: test_config(bad),
+                    capability_zones: None,
+                        config: test_config(bad),
                 })
                 .is_err(),
                 "base threshold {bad} should be rejected"
@@ -1523,7 +1883,8 @@ mod tests {
                     efficient_target: ModelId::from("e"),
                     capable_target: ModelId::from("c"),
                     capability_targets: Vec::new(),
-                    config,
+                    capability_zones: None,
+                        config,
                 })
                 .is_err()
             );
@@ -1534,6 +1895,7 @@ mod tests {
                 efficient_target: ModelId::from("e"),
                 capable_target: ModelId::from("c"),
                 capability_targets: Vec::new(),
+                capability_zones: None,
                 config: test_config(base_threshold),
             })?;
         }
@@ -1698,6 +2060,7 @@ mod tests {
                 rung("cheap", 0.5, 0.1),
                 rung("mid", 0.5, 0.4),
             ],
+            capability_zones: None,
             config: test_config(TEST_THRESHOLD),
         })?;
         let _ = router;
@@ -1741,7 +2104,8 @@ mod tests {
                 efficient_target: ModelId::from("e"),
                 capable_target: ModelId::from("c"),
                 capability_targets: vec![rung("only", 0.5)],
-                    config: test_config(TEST_THRESHOLD),
+                capability_zones: None,
+                config: test_config(TEST_THRESHOLD),
             })
             .is_err()
         );
@@ -1752,10 +2116,232 @@ mod tests {
                 efficient_target: ModelId::from("e"),
                 capable_target: ModelId::from("c"),
                 capability_targets: vec![rung("a", 0.5), rung("b", 1.5)],
-                    config: test_config(TEST_THRESHOLD),
+                capability_zones: None,
+                config: test_config(TEST_THRESHOLD),
             })
             .is_err()
         );
+    }
+
+    // ── Confidence zones and fan-out ────────────────────────────────────────
+
+    fn cost_rung(name: &str, capability: f64, price: f64) -> CapabilityTarget {
+        CapabilityTarget {
+            target: ModelId::from(name),
+            capability,
+            cost: switchyard_protocol::TargetCost {
+                input_per_1m: price,
+                output_per_1m: price,
+            },
+        }
+    }
+
+    fn test_zones() -> ZoneConfig {
+        ZoneConfig {
+            low_threshold: 0.3,
+            high_threshold: 0.7,
+            fan_out: 3,
+            output_judge_target: ModelId::from("output_judge"),
+            output_judge_contract: ClassifierContractConfig::default(),
+            output_judge_max_output_tokens: 256,
+        }
+    }
+
+    /// A four-rung ladder (nano < strong < ultra < opus by cost) with zones enabled.
+    fn zoned_router() -> Result<Arc<LlmTaskClassifier>> {
+        Ok(Arc::new(LlmTaskClassifier::new(
+            LlmClassifierConfig::Capability {
+                judge_target: ModelId::from("judge"),
+                efficient_target: ModelId::from("nano"),
+                capable_target: ModelId::from("opus"),
+                capability_targets: vec![
+                    cost_rung("nano", 0.2, 0.1),
+                    cost_rung("strong", 0.5, 0.5),
+                    cost_rung("ultra", 0.8, 1.0),
+                    cost_rung("opus", 1.0, 3.0),
+                ],
+                capability_zones: Some(test_zones()),
+                config: test_config(TEST_THRESHOLD),
+            },
+        )?))
+    }
+
+    /// Serves the capability judge with a fixed verdict, the output judge with a fixed
+    /// winner, and every answer target with distinguishable prose. Records each call.
+    fn recording_zone_serve(
+        calls: Arc<Mutex<Vec<String>>>,
+        p_solve: f64,
+        boundary: &str,
+        minimum_capability: f64,
+        winner: usize,
+    ) -> impl Serve {
+        let boundary = boundary.to_string();
+        move |model: ModelId, _request: Request| {
+            let calls = Arc::clone(&calls);
+            let boundary = boundary.clone();
+            let model = model.to_string();
+            async move {
+                calls.lock().push(model.clone());
+                match model.as_str() {
+                    "judge" => Ok(reply(format!(
+                        r#"{{"crux":"crux","primary_rule":"SUP-1","capability_boundary":"{boundary}","p_solve":{p_solve},"minimum_capability":{minimum_capability}}}"#
+                    ))),
+                    "output_judge" => {
+                        Ok(reply(format!(r#"{{"winner":{winner},"reason":"best"}}"#)))
+                    }
+                    other => Ok(reply(format!("answer from {other}"))),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn zone_a_answers_with_a_single_cheapest_adequate_call() -> Result<()> {
+        let router = zoned_router()?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let serve = recording_zone_serve(Arc::clone(&calls), 0.9, "supported", 0.2, 0);
+
+        let (_trace, response) = test_drive(router, classify_request(), serve).await?;
+
+        assert_eq!(
+            response.llm_response.as_agg().map(completion_text),
+            Some("answer from nano".to_string())
+        );
+        // No fan-out, no output judge: judge then the one cheap answer call.
+        assert_eq!(*calls.lock(), vec!["judge".to_string(), "nano".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zone_c_routes_to_the_most_capable_rung_without_fanning_out() -> Result<()> {
+        let router = zoned_router()?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let serve = recording_zone_serve(Arc::clone(&calls), 0.1, "supported", 0.2, 0);
+
+        let (_trace, response) = test_drive(router, classify_request(), serve).await?;
+
+        assert_eq!(
+            response.llm_response.as_agg().map(completion_text),
+            Some("answer from opus".to_string())
+        );
+        assert_eq!(*calls.lock(), vec!["judge".to_string(), "opus".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_boundary_forces_zone_c_even_at_high_confidence() -> Result<()> {
+        let router = zoned_router()?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let serve = recording_zone_serve(Arc::clone(&calls), 0.95, "unsupported", 0.2, 0);
+
+        let (_trace, response) = test_drive(router, classify_request(), serve).await?;
+
+        assert_eq!(
+            response.llm_response.as_agg().map(completion_text),
+            Some("answer from opus".to_string())
+        );
+        assert_eq!(*calls.lock(), vec!["judge".to_string(), "opus".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zone_b_fans_out_and_the_output_judge_picks_the_winner() -> Result<()> {
+        let router = zoned_router()?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        // Mid confidence, level 0.2: every rung is eligible, so the cheapest three fan out.
+        let serve = recording_zone_serve(Arc::clone(&calls), 0.5, "supported", 0.2, 1);
+
+        let (_trace, response) = test_drive(router, classify_request(), serve).await?;
+
+        // Winner index 1 is "strong".
+        assert_eq!(
+            response.llm_response.as_agg().map(completion_text),
+            Some("answer from strong".to_string())
+        );
+        let calls = calls.lock().clone();
+        assert_eq!(calls.first().map(String::as_str), Some("judge"));
+        assert_eq!(calls.last().map(String::as_str), Some("output_judge"));
+        let mut fanned = calls[1..calls.len() - 1].to_vec();
+        fanned.sort();
+        assert_eq!(fanned, vec!["nano", "strong", "ultra"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zone_b_fans_out_only_over_the_rungs_that_clear_the_level() -> Result<()> {
+        let router = zoned_router()?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        // Level 0.6 leaves ultra and opus eligible; only those two fan out.
+        let serve = recording_zone_serve(Arc::clone(&calls), 0.5, "supported", 0.6, 1);
+
+        let (_trace, response) = test_drive(router, classify_request(), serve).await?;
+
+        assert_eq!(
+            response.llm_response.as_agg().map(completion_text),
+            Some("answer from opus".to_string())
+        );
+        let calls = calls.lock().clone();
+        assert_eq!(calls.first().map(String::as_str), Some("judge"));
+        assert_eq!(calls.last().map(String::as_str), Some("output_judge"));
+        let mut fanned = calls[1..calls.len() - 1].to_vec();
+        fanned.sort();
+        assert_eq!(fanned, vec!["opus", "ultra"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zone_b_falls_back_to_the_cheapest_candidate_when_the_judge_misfires() -> Result<()> {
+        let router = zoned_router()?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        // Winner index 9 is out of range for three candidates: fall back to index 0.
+        let serve = recording_zone_serve(Arc::clone(&calls), 0.5, "supported", 0.2, 9);
+
+        let (_trace, response) = test_drive(router, classify_request(), serve).await?;
+
+        assert_eq!(
+            response.llm_response.as_agg().map(completion_text),
+            Some("answer from nano".to_string())
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn zone_b_calls_its_candidates_concurrently() -> Result<()> {
+        // Each candidate blocks on a barrier of three: without concurrent service the
+        // barrier never fills and the run times out, so passing proves concurrency.
+        let router = zoned_router()?;
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let serve = {
+            let barrier = Arc::clone(&barrier);
+            move |model: ModelId, _request: Request| {
+                let barrier = Arc::clone(&barrier);
+                let model = model.to_string();
+                async move {
+                    match model.as_str() {
+                        "judge" => Ok(reply(
+                            r#"{"crux":"c","primary_rule":"SUP-1","capability_boundary":"supported","p_solve":0.5,"minimum_capability":0.2}"#
+                                .to_string(),
+                        )),
+                        "output_judge" => Ok(reply(r#"{"winner":0,"reason":"best"}"#.to_string())),
+                        other => {
+                            barrier.wait().await;
+                            Ok(reply(format!("answer from {other}")))
+                        }
+                    }
+                }
+            }
+        };
+
+        let run = test_drive(router, classify_request(), serve);
+        let (_trace, response) = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .map_err(|error| LibsyError::external("zone B fan-out deadlocked", error))??;
+
+        assert_eq!(
+            response.llm_response.as_agg().map(completion_text),
+            Some("answer from nano".to_string())
+        );
+        Ok(())
     }
 
     /// The text of each message a judge with `recent_turn_window` would be sent.
