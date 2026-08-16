@@ -222,7 +222,13 @@ pub struct CapabilityTarget {
     pub capability: f64,
     /// Unit pricing inherited from the target's deployment config.
     pub cost: switchyard_protocol::TargetCost,
+    /// The rung's context window in tokens; `None` means unknown (never prefiltered).
+    pub context_window: Option<u32>,
 }
+
+/// Context headroom factor: a rung is only eligible if its window fits the request
+/// with 15% to spare, so the estimate's slack does not push a call over the limit.
+const CONTEXT_HEADROOM_PERCENT: u64 = 115;
 
 impl CapabilityTarget {
     /// Validates the declared capability level.
@@ -234,6 +240,15 @@ impl CapabilityTarget {
     /// summed because the request's input/output split is not known at select time.
     fn cost_key(&self) -> f64 {
         self.cost.input_per_1m + self.cost.output_per_1m
+    }
+
+    /// Whether this rung's context window fits the request. Unknown on either side
+    /// means do not prefilter — an unknown window is never a reason to skip a rung.
+    fn fits_context(&self, needed_tokens: Option<u64>) -> bool {
+        match (self.context_window, needed_tokens) {
+            (Some(window), Some(needed)) => u64::from(window) >= needed,
+            _ => true,
+        }
     }
 }
 
@@ -287,8 +302,10 @@ impl TaskClassifierPolicy {
     }
 
     /// Picks the cheapest rung whose declared capability clears the judge's required
-    /// level. The ladder is cost-ascending, so the first adequate rung is the pick.
-    fn ranked_pick(&self, verdict: &TaskClassifierVerdict) -> ModelId {
+    /// level and whose context window fits the request. The ladder is cost-ascending,
+    /// so the first adequate rung is the pick. `needed_tokens` is the request's
+    /// estimated size including headroom; `None` skips the context prefilter.
+    fn ranked_pick(&self, verdict: &TaskClassifierVerdict, needed_tokens: Option<u64>) -> ModelId {
         // An unsupported boundary means the cheap tiers are judged out; go straight to
         // the strongest rung rather than trusting a level the judge already flagged.
         if verdict.capability_boundary == "unsupported" {
@@ -301,9 +318,38 @@ impl TaskClassifierPolicy {
         };
         self.ranked
             .iter()
-            .find(|rung| rung.capability >= required)
+            .find(|rung| rung.capability >= required && rung.fits_context(needed_tokens))
             .map(|rung| rung.target.clone())
             .unwrap_or_else(|| self.most_capable().clone())
+    }
+
+    /// The full pick as a classification, with an optional context size for the prefilter.
+    fn classify(
+        &self,
+        verdict: &TaskClassifierVerdict,
+        needed_tokens: Option<u64>,
+    ) -> Classification {
+        if self.ranked.is_empty() {
+            // Binary mode has no ladder; the context prefilter does not apply.
+            let Some(threshold) = self.threshold(verdict) else {
+                return Classification::Ambiguous(vec![]);
+            };
+            let target = if verdict.p_solve >= threshold
+                || (threshold - verdict.p_solve).abs() <= f64::EPSILON
+            {
+                &self.efficient_target
+            } else {
+                &self.capable_target
+            };
+            return Classification::Scores(vec![Score {
+                target: target.clone(),
+                confidence: 1.0,
+            }]);
+        }
+        Classification::Scores(vec![Score {
+            target: self.ranked_pick(verdict, needed_tokens),
+            confidence: 1.0,
+        }])
     }
 }
 
@@ -316,29 +362,9 @@ impl JudgePolicy for TaskClassifierPolicy {
         let Some(verdict) = verdict.filter(|verdict| verdict.is_valid()) else {
             return Classification::Ambiguous(vec![]);
         };
-        // Cost-aware ladder: pick the cheapest rung adequate for the judged level.
-        if !self.ranked.is_empty() {
-            return Classification::Scores(vec![Score {
-                target: self.ranked_pick(verdict),
-                confidence: 1.0,
-            }]);
-        }
-        // A usable verdict below the capability threshold is still a decision: the judge
-        // does not trust the efficient tier with this task.
-        let Some(threshold) = self.threshold(verdict) else {
-            return Classification::Ambiguous(vec![]);
-        };
-        let target = if verdict.p_solve >= threshold
-            || (threshold - verdict.p_solve).abs() <= f64::EPSILON
-        {
-            &self.efficient_target
-        } else {
-            &self.capable_target
-        };
-        Classification::Scores(vec![Score {
-            target: target.clone(),
-            confidence: 1.0,
-        }])
+        // No request context here, so the context prefilter does not apply; the
+        // request-aware classifier calls `classify` with the estimate instead.
+        self.classify(verdict, None)
     }
 }
 
@@ -712,22 +738,18 @@ impl Classifier<State> for CostAwareClassifier {
         let Some(verdict) = verdict.filter(|verdict| verdict.is_valid()) else {
             return Ok((Classification::Ambiguous(vec![]), None));
         };
+        // Estimated request size with headroom, for the context prefilter.
+        let needed = Some(Self::needed_tokens(request));
         let Some(zones) = &self.zones else {
             // No zones: the ranked pick is the whole decision, a single call.
-            return Ok((
-                self.classifier.policy().to_classification(Some(&verdict)),
-                None,
-            ));
+            return Ok((self.classifier.policy().classify(&verdict, needed), None));
         };
         // The bandit nudges the judge's confidence from the cheapest adequate rung's
         // observed rewards before the zone decision — a failing cheap tier drops toward
         // fan-out or the capable rung.
         let p_solve = self.corrected_p_solve(&verdict, request);
         match Self::zone(p_solve, &verdict, zones) {
-            Zone::Answer => Ok((
-                self.classifier.policy().to_classification(Some(&verdict)),
-                None,
-            )),
+            Zone::Answer => Ok((self.classifier.policy().classify(&verdict, needed), None)),
             Zone::Capable => Ok((decisive(&self.capable_target), None)),
             Zone::FanOut => self.fan_out(request, driver, &verdict, zones).await,
         }
@@ -735,6 +757,11 @@ impl Classifier<State> for CostAwareClassifier {
 }
 
 impl CostAwareClassifier {
+    /// The request's estimated token size with context headroom (the 15% rule).
+    fn needed_tokens(request: &Request) -> u64 {
+        estimate_request_tokens(request) * CONTEXT_HEADROOM_PERCENT / 100
+    }
+
     /// Maps a (possibly bandit-corrected) confidence to its zone. An unsupported boundary
     /// is always Zone C: the judge already distrusts the cheap tiers, whatever p_solve says.
     fn zone(p_solve: f64, verdict: &TaskClassifierVerdict, zones: &ZoneRuntime) -> Zone {
@@ -786,16 +813,19 @@ impl CostAwareClassifier {
         verdict: &TaskClassifierVerdict,
         zones: &ZoneRuntime,
     ) -> Result<(Classification, Option<Response>)> {
-        // Eligible rungs clear the judged level, cheapest first; without a level the
-        // whole ladder is eligible. The ladder is already cost-ordered.
-        let eligible: Vec<&CapabilityTarget> = match verdict.minimum_capability {
-            Some(required) => self
-                .ranked
-                .iter()
-                .filter(|rung| rung.capability >= required)
-                .collect(),
-            None => self.ranked.iter().collect(),
-        };
+        // Eligible rungs clear the judged level and fit the request's context, cheapest
+        // first; without a level the whole ladder is eligible. The ladder is cost-ordered.
+        let needed = Some(Self::needed_tokens(request));
+        let eligible: Vec<&CapabilityTarget> = self
+            .ranked
+            .iter()
+            .filter(|rung| {
+                verdict
+                    .minimum_capability
+                    .is_none_or(|required| rung.capability >= required)
+                    && rung.fits_context(needed)
+            })
+            .collect();
         let candidates: Vec<&CapabilityTarget> = eligible.into_iter().take(zones.fan_out).collect();
         match candidates.len() {
             // No rung clears the level: this is Zone C's job, not a fan-out.
@@ -932,6 +962,7 @@ fn into_response(
         metadata,
     }
 }
+
 
 // ── Escalation classifier ──────────────────────────────────────────────────
 
@@ -2042,6 +2073,7 @@ mod tests {
                 input_per_1m: price,
                 output_per_1m: price,
             },
+            context_window: None,
         };
         TaskClassifierPolicy::new("efficient", "capable", &test_config(TEST_THRESHOLD))
             .with_ranked_targets(vec![
@@ -2117,6 +2149,7 @@ mod tests {
                 input_per_1m: price,
                 output_per_1m: price,
             },
+            context_window: None,
         };
         let router = LlmTaskClassifier::new(LlmClassifierConfig::Capability {
             judge_target: ModelId::from("judge"),
@@ -2164,6 +2197,7 @@ mod tests {
             target: ModelId::from(name),
             capability,
             cost: switchyard_protocol::TargetCost::default(),
+            context_window: None,
         };
         // One rung is not a ladder.
         assert!(
@@ -2193,6 +2227,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_context_prefilter_skips_rungs_that_cannot_fit_the_request() -> Result<()> {
+        let rung =
+            |name: &str, capability: f64, price: f64, window: Option<u32>| CapabilityTarget {
+                target: ModelId::from(name),
+                capability,
+                cost: switchyard_protocol::TargetCost {
+                    input_per_1m: price,
+                    output_per_1m: price,
+                },
+                context_window: window,
+            };
+        // Two same-capability rungs: a cheap one with a tiny window and a pricier roomy one.
+        let policy =
+            TaskClassifierPolicy::new("efficient", "capable", &test_config(TEST_THRESHOLD))
+                .with_ranked_targets(vec![
+                    rung("tiny", 0.5, 0.1, Some(1_000)),
+                    rung("roomy", 0.5, 0.5, Some(1_000_000)),
+                ]);
+        let verdict = ranked_verdict(0.9, "supported", "SUP-1", 0.5);
+
+        // A 5_000-token request overflows the tiny window, so the roomy rung serves it.
+        let big = policy
+            .classify(&verdict, Some(5_000))
+            .argmax(false)?
+            .map(|score| score.target);
+        assert_eq!(big, Some(ModelId::from("roomy")));
+
+        // A small request fits both, so the cheaper one wins.
+        let small = policy
+            .classify(&verdict, Some(100))
+            .argmax(false)?
+            .map(|score| score.target);
+        assert_eq!(small, Some(ModelId::from("tiny")));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_context_window_is_never_a_reason_to_skip_a_rung() -> Result<()> {
+        let rung =
+            |name: &str, capability: f64, price: f64, window: Option<u32>| CapabilityTarget {
+                target: ModelId::from(name),
+                capability,
+                cost: switchyard_protocol::TargetCost {
+                    input_per_1m: price,
+                    output_per_1m: price,
+                },
+                context_window: window,
+            };
+        let policy =
+            TaskClassifierPolicy::new("efficient", "capable", &test_config(TEST_THRESHOLD))
+                .with_ranked_targets(vec![rung("unknown", 0.5, 0.1, None)]);
+        let verdict = ranked_verdict(0.9, "supported", "SUP-1", 0.5);
+        // Even a huge estimated size cannot prefilter a rung with no declared window.
+        let pick = policy
+            .classify(&verdict, Some(u64::MAX))
+            .argmax(false)?
+            .map(|score| score.target);
+        assert_eq!(pick, Some(ModelId::from("unknown")));
+        Ok(())
+    }
+
     // ── Confidence zones and fan-out ────────────────────────────────────────
 
     fn cost_rung(name: &str, capability: f64, price: f64) -> CapabilityTarget {
@@ -2203,6 +2299,7 @@ mod tests {
                 input_per_1m: price,
                 output_per_1m: price,
             },
+            context_window: None,
         }
     }
 

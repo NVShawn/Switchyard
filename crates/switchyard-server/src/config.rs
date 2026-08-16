@@ -344,6 +344,9 @@ enum ClassifierPolicyConfig {
 struct CapabilityTargetConfig {
     target: String,
     capability: f64,
+    /// The rung's context window in tokens, for the headroom prefilter.
+    #[serde(default)]
+    context_window: Option<u32>,
 }
 
 /// Confidence-zone and fan-out settings for a capability ladder (`[routes.x.zones]`).
@@ -1115,6 +1118,7 @@ fn build_algorithm(
                                 target,
                                 capability: rung.capability,
                                 cost,
+                                context_window: rung.context_window,
                             })
                         })
                         .collect::<ServerResult<Vec<_>>>()?;
@@ -1545,6 +1549,18 @@ capability_targets = [
     fn a_capability_ladder_builds_cost_aware_routing() -> ServerResult<()> {
         // The ladder parses and builds; strong/weak default to the ladder endpoints.
         let state = server_state_from_toml(LADDER_CONFIG)?;
+        assert_eq!(state.models().collect::<Vec<_>>(), ["switchyard/ladder"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_rung_may_declare_a_context_window() -> ServerResult<()> {
+        // A per-rung context_window drives the headroom prefilter; it must parse.
+        let with_window = LADDER_CONFIG.replace(
+            "{ target = \"nano\", capability = 0.2 }",
+            "{ target = \"nano\", capability = 0.2, context_window = 262000 }",
+        );
+        let state = server_state_from_toml(&with_window)?;
         assert_eq!(state.models().collect::<Vec<_>>(), ["switchyard/ladder"]);
         Ok(())
     }
