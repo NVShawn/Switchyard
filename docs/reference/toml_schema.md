@@ -83,6 +83,7 @@ calls an upstream.
 | `id` | Yes | — | Exact model ID sent upstream. |
 | `llm_client` | Yes | — | Key under `[llm_clients]`. |
 | `extra_body` | No | `{}` | Values merged into the upstream request when the request does not already set that key. |
+| `cost` | No | unset | Unit pricing for the target, used by cost-aware routes and the routing log. A table with `input_per_1m` and `output_per_1m` (USD per 1M tokens), both non-negative and finite. |
 
 ## `[routes.<name>]`
 
@@ -158,6 +159,44 @@ Capability mode classifies before serving. See
 | `message_hash_fallback` | No | `false` | Keys affinity on the first user message. Requires `session_affinity`. |
 | `recent_turn_window` | No | unset | When unset, the judge sees the opening task and latest user follow-up, when present. When set, it also sees trailing turns. |
 | `prompt` | No | packaged prompt | Replaces the capability prompt. The packaged schema is sent separately as structured-output configuration. |
+
+Capability mode can also route among more than two tiers. `capability_targets`
+declares a cost-ordered ladder; each rung is `{ target, capability, context_window? }`
+where `capability` is a static level in `[0, 1]` and `context_window` is the rung's
+token limit for the headroom prefilter. The judge's verdict adds a
+`minimum_capability` level, and Switchyard picks the cheapest rung whose declared
+`capability` clears it and whose `context_window` fits the request. Every rung's
+target must declare a `cost`. When `capability_targets` is set, `strong_target` and
+`weak_target` default to the most and least capable rungs.
+
+| Key | Required | Default | Meaning |
+|---|:---:|---|---|
+| `capability_targets` | No | unset | Ordered ladder of `{ target, capability, context_window? }` rungs for cost-aware routing. Requires a `cost` on every rung's target. |
+
+Two optional sub-tables layer on a ladder. `[routes.<name>.zones]` turns on
+three-zone routing: a high-confidence answer goes to the cheapest adequate rung
+in a single call, a low-confidence or unsupported one goes straight to the most
+capable rung, and the mid band fans out to `fan_out` rungs concurrently and lets
+an output judge pick the best answer. `[routes.<name>.bandit]` turns on a
+Thompson-sampling correction that nudges the judge's confidence from observed
+per-rung rewards recorded in the routing log (`--routing-log-file`).
+
+`[routes.<name>.zones]`:
+
+| Key | Required | Default | Meaning |
+|---|:---:|---|---|
+| `low_threshold` | Yes | — | Below this solve probability, route to the most capable rung. |
+| `high_threshold` | Yes | — | At or above this, answer with one cheapest-adequate call. Must satisfy `0 <= low_threshold <= high_threshold <= 1`. |
+| `fan_out` | Yes | — | How many eligible rungs the mid band calls concurrently. At least `1`. |
+| `output_judge_target` | Yes | — | Target that judges the fanned-out candidate answers. Not a routing destination. |
+| `output_judge_prompt` | No | packaged prompt | Replaces the output-judge prompt. |
+| `output_judge_max_output_tokens` | No | `4096` | Maximum completion tokens for the output-judge verdict. |
+
+`[routes.<name>.bandit]` requires `zones`:
+
+| Key | Required | Default | Meaning |
+|---|:---:|---|---|
+| `scale` | Yes | — | How far one bandit sample can move the judge's solve probability: `corrected = p_solve + (sample - 0.5) * scale`. Non-negative and finite. |
 
 Escalation mode serves the weak target first and judges the completed turn. See
 [Escalation-Router Routing](../routing_algorithms/escalation_router_routing.md).

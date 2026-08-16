@@ -81,6 +81,22 @@ switchyard-server --config routes.toml \
   --host 127.0.0.1 --port 4000
 ```
 
+## Offline Analysis: `switchyard dream`
+
+`switchyard dream` is an offline, out-of-request-path analysis tool. It reads a
+routing log written by the server (`--routing-log-file`) and, for cost-aware
+routes, reports per-`(model, token bucket)` reward posteriors, the cheap-but-wrong
+rate, and the serving judge's calibration (Brier score of its logged `p_solve`
+against observed outcomes). With `--strong-model`, it also re-judges each logged
+task header through an OpenAI-compatible model and writes fine-tune labels.
+
+```bash
+switchyard dream --log routing.jsonl [--out labels.jsonl] \
+  [--strong-model <model>] [--base-url <url>] [--api-key <key>]
+```
+
+The strong-model re-judging uses `OPENAI_API_KEY` when `--api-key` is not given.
+
 ## Removed Setup Commands
 
 `switchyard configure`, `switchyard serve`, and `switchyard verify` are not

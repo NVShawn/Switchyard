@@ -70,6 +70,45 @@ greater than or equal to the applicable threshold. Otherwise it routes to
 An invalid, inconsistent, or unparseable verdict, or a judge failure, routes to
 `strong_target`. Raising either knob sends more traffic to the strong model.
 
+## Cost-aware multi-target routing
+
+Capability mode is not limited to two tiers. When each target declares a `cost`,
+you can route among several models on a price-ordered ladder and let the judge's
+confidence pick the cheapest tier that can handle the task:
+
+```toml
+[routes.smart]
+id = "smart"
+type = "llm_classifier"
+mode = "capability"
+classifier_target = "classifier"
+base_threshold = 0.5
+capability_targets = [
+  { target = "nano", capability = 0.2, context_window = 262000 },
+  { target = "strong", capability = 0.5, context_window = 200000 },
+  { target = "opus", capability = 1.0, context_window = 1000000 },
+]
+```
+
+Each rung declares a static `capability` level in `[0, 1]` and an optional
+`context_window`. The judge's verdict adds a `minimum_capability` level — its
+estimate of the weakest tier that will still solve the task. Switchyard picks the
+cheapest rung whose `capability` clears that level and whose `context_window`
+fits the request with 15% headroom. An `unsupported` boundary, or a verdict with
+no usable level, routes to the most capable rung. Every rung's target must
+declare a `cost`; the ladder is ordered cheapest-first by unit price.
+
+Two optional sub-tables layer on a ladder. `[routes.smart.zones]` turns on
+three-zone routing with fan-out on uncertainty: high `p_solve` answers with a
+single cheapest-adequate call, low `p_solve` or an `unsupported` boundary routes
+straight to the most capable rung, and the mid band calls the cheapest `fan_out`
+eligible rungs concurrently and lets an output judge pick the best answer.
+`[routes.smart.bandit]` turns on a Thompson-sampling correction that nudges the
+judge's confidence from per-rung outcomes recorded in the routing log (start the
+server with `--routing-log-file`).
+
+See [TOML Schema](../reference/toml_schema.md) for every key.
+
 ## Judge model compatibility
 
 The judge must return complete, schema-valid JSON in normal assistant `content`.
