@@ -10,7 +10,7 @@ use opentelemetry::{KeyValue, global};
 use switchyard_protocol::{LlmResponse, LlmResponseChunk, Response, Usage};
 
 use crate::SharedRoutingLog;
-use crate::routing_log::{Outcome, RoutingLogContext, compute_reward};
+use crate::routing_log::{JudgeVerdict, Outcome, RoutingLogContext, compute_reward};
 use crate::stats::{StatsAccumulator, TokenUsage};
 use switchyard_protocol::TargetCost;
 
@@ -34,6 +34,12 @@ pub(crate) fn observe(
         metadata,
     } = response;
     let model = model.to_string();
+    // The classifier stamps the judge's verdict into the request's extra_metadata, which
+    // the served response carries through. Read it once for the routing record.
+    let verdict = metadata
+        .as_ref()
+        .map(JudgeVerdict::from_metadata)
+        .unwrap_or_default();
 
     let llm_response = match llm_response {
         LlmResponse::Agg(agg) => {
@@ -52,6 +58,7 @@ pub(crate) fn observe(
                         success: true,
                         reward: Some(compute_reward(cost_usd, latency_ms, true)),
                     },
+                    verdict,
                 );
             }
             LlmResponse::Agg(agg)
@@ -103,6 +110,7 @@ pub(crate) fn observe(
                             success,
                             reward: Some(compute_reward(cost_usd, latency_ms, success)),
                         },
+                        verdict.clone(),
                     );
                 }
                 // A failed stream already counted its error; only a clean end records

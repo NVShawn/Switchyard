@@ -9,6 +9,7 @@ from switchyard.dream import (
     brier_score,
     cheap_wrong_rate,
     emit_labels,
+    judge_calibration,
     read_records,
     summarize_arms,
     teacher_calibration,
@@ -111,3 +112,33 @@ def test_teacher_calibration_scores_against_observed_outcomes():
     assert teacher_calibration(labels) == 0.025
     # Records lacking a verdict or outcome are skipped.
     assert teacher_calibration([{"label": {}, "outcome": {}}]) == 0.0
+
+
+def test_judge_calibration_uses_the_logged_verdict():
+    records = [
+        # Answer records carrying the serving judge's verdict.
+        {"model": "nano", "success": True, "judge_p_solve": 0.9},
+        {"model": "nano", "success": False, "judge_p_solve": 0.2},
+        # A classifier record is not an answer and is skipped.
+        {"model": "judge", "tier": "classifier", "success": True, "judge_p_solve": 0.9},
+        # An answer record with no verdict is skipped.
+        {"model": "opus", "success": True},
+    ]
+    assert judge_calibration(records) == 0.025
+
+
+def test_emit_labels_include_the_logged_judge_verdict():
+    records = [
+        {
+            "model": "nano",
+            "task": "fix the test",
+            "success": True,
+            "reward": 0.9,
+            "judge_p_solve": 0.8,
+            "judge_capability_boundary": "supported",
+        }
+    ]
+    labels = emit_labels(records, _fake_judge)
+    assert labels[0]["judge_verdict"]["p_solve"] == 0.8
+    assert labels[0]["judge_verdict"]["capability_boundary"] == "supported"
+    assert labels[0]["label"]["minimum_capability"] == 0.2

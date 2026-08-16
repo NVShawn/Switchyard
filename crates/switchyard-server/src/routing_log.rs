@@ -42,6 +42,37 @@ pub(crate) struct Outcome {
     pub(crate) reward: Option<f64>,
 }
 
+/// The capability judge's verdict for a routed call, surfaced so the offline dream
+/// step can score the real judge's calibration against observed outcomes.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct JudgeVerdict {
+    /// The judge's solve-probability estimate.
+    pub(crate) p_solve: Option<f64>,
+    /// The judge's capability boundary classification.
+    pub(crate) capability_boundary: Option<String>,
+    /// The judge's minimum required capability level.
+    pub(crate) minimum_capability: Option<f64>,
+}
+
+impl JudgeVerdict {
+    /// Reads the verdict the classifier stamped into the request's `extra_metadata`.
+    /// Absent keys (a non-capability route) yield a default (empty) verdict.
+    pub(crate) fn from_metadata(metadata: &Metadata) -> Self {
+        let Some(extra) = metadata.extra_metadata.as_ref() else {
+            return Self::default();
+        };
+        Self {
+            p_solve: extra
+                .get("switchyard.judge.p_solve")
+                .and_then(|value| value.parse().ok()),
+            capability_boundary: extra.get("switchyard.judge.capability_boundary").cloned(),
+            minimum_capability: extra
+                .get("switchyard.judge.minimum_capability")
+                .and_then(|value| value.parse().ok()),
+        }
+    }
+}
+
 /// Computes a 0..1 reward from cost and latency, blended with a success bonus.
 ///
 /// A failed call scores 0.0 — the cost and latency were spent without a usable
@@ -94,6 +125,7 @@ impl RoutingLog {
         tier: Option<&str>,
         usage: Option<&Usage>,
         outcome: Outcome,
+        verdict: JudgeVerdict,
     ) -> std::io::Result<()> {
         let usage = usage.map(token_usage).unwrap_or_default();
         let record = RoutingRecord {
@@ -114,6 +146,9 @@ impl RoutingLog {
             success: Some(outcome.success),
             reward: outcome.reward,
             token_bucket: context.token_bucket.map(Cow::Owned),
+            judge_p_solve: verdict.p_solve,
+            judge_capability_boundary: verdict.capability_boundary.map(Cow::Owned),
+            judge_minimum_capability: verdict.minimum_capability,
         };
         let mut line = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
         line.push(b'\n');
@@ -266,6 +301,13 @@ struct RoutingRecord<'a> {
     /// Bandit token bucket, when the request size was estimated.
     #[serde(borrow)]
     token_bucket: Option<Cow<'a, str>>,
+    /// The judge's solve-probability estimate, when a capability judge ran.
+    judge_p_solve: Option<f64>,
+    /// The judge's capability boundary, when a capability judge ran.
+    #[serde(borrow)]
+    judge_capability_boundary: Option<Cow<'a, str>>,
+    /// The judge's minimum required capability level, when a capability judge ran.
+    judge_minimum_capability: Option<f64>,
 }
 
 /// Session totals returned by the routing stats endpoint.

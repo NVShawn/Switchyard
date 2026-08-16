@@ -29,8 +29,8 @@ use crate::core::classifier::{Classification, Classifier, Score};
 use crate::core::state::{State, StateValue};
 use crate::{LibsyError, Result};
 use switchyard_protocol::{
-    AggLlmResponse, InstructionBlock, LlmClientError, LlmRequest, LlmResponse, OutputParams,
-    Request, Response,
+    AggLlmResponse, InstructionBlock, LlmClientError, LlmRequest, LlmResponse, Metadata,
+    OutputParams, Request, Response,
 };
 
 const PROMPT_TEMPLATE: &str = include_str!("../prompts/capability-classifier/prompt.md");
@@ -738,6 +738,8 @@ impl Classifier<State> for CostAwareClassifier {
         let Some(verdict) = verdict.filter(|verdict| verdict.is_valid()) else {
             return Ok((Classification::Ambiguous(vec![]), None));
         };
+        // Carry the verdict to the routing log for offline judge calibration.
+        stamp_judge_verdict(request, &verdict);
         // Estimated request size with headroom, for the context prefilter.
         let needed = Some(Self::needed_tokens(request));
         let Some(zones) = &self.zones else {
@@ -963,6 +965,27 @@ fn into_response(
     }
 }
 
+/// Stamps the judge's verdict onto the request so the served response carries it to
+/// the routing log for the feedback loop's offline calibration. Internal-only:
+/// `extra_metadata` never reaches the provider or the wire.
+fn stamp_judge_verdict(request: &mut Request, verdict: &TaskClassifierVerdict) {
+    let metadata = request.metadata.get_or_insert_with(Metadata::default);
+    let extra = metadata.extra_metadata.get_or_insert_with(BTreeMap::new);
+    extra.insert(
+        "switchyard.judge.p_solve".to_string(),
+        verdict.p_solve.to_string(),
+    );
+    extra.insert(
+        "switchyard.judge.capability_boundary".to_string(),
+        verdict.capability_boundary.clone(),
+    );
+    if let Some(level) = verdict.minimum_capability {
+        extra.insert(
+            "switchyard.judge.minimum_capability".to_string(),
+            level.to_string(),
+        );
+    }
+}
 
 // ── Escalation classifier ──────────────────────────────────────────────────
 

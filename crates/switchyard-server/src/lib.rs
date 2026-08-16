@@ -189,11 +189,12 @@ impl SharedRoutingLog {
         tier: Option<&str>,
         usage: Option<&Usage>,
         outcome: routing_log::Outcome,
+        verdict: routing_log::JudgeVerdict,
     ) {
         if let Err(error) = self
             .writer
             .lock()
-            .append(context, model, tier, usage, outcome)
+            .append(context, model, tier, usage, outcome, verdict)
         {
             tracing::warn!(path = %self.path.display(), %error, "routing log append failed");
         }
@@ -549,6 +550,7 @@ fn stats_observer(
                                     cost_usd, latency_ms, false,
                                 )),
                             },
+                            routing_log::JudgeVerdict::default(),
                         );
                     }
                 }
@@ -566,6 +568,7 @@ fn stats_observer(
                             // Classifier calls are not bandit arms, so they carry no reward.
                             reward: None,
                         },
+                        routing_log::JudgeVerdict::default(),
                     );
                 }
                 stats.record_classifier_success(

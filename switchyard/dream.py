@@ -144,6 +144,25 @@ def brier_score(predictions: list[tuple[float, bool]]) -> float:
     )
 
 
+def judge_calibration(records: list[dict[str, Any]]) -> float:
+    """Brier score of the *logged* capability judge's `p_solve` against observed success.
+
+    This is the serving judge's own calibration — no teacher required. Only answer
+    records that carried a verdict count. The outcome here is transport-level success,
+    which misses wrong-but-200 answers, so read this as a floor on the judge's true
+    error, not a measure of answer correctness.
+    """
+    predictions = []
+    for record in records:
+        if record.get("tier") == _CLASSIFIER_TIER:
+            continue
+        p_solve = record.get("judge_p_solve")
+        success = record.get("success")
+        if isinstance(p_solve, (int, float)) and isinstance(success, bool):
+            predictions.append((float(p_solve), success))
+    return brier_score(predictions)
+
+
 def _judge_prompt(task: str) -> str:
     """The compact re-judging prompt, in the capability judge's contract."""
     rules = ", ".join(_RULES)
@@ -216,6 +235,13 @@ def emit_labels(
             {
                 "task": task,
                 "label": verdicts[task],
+                # The serving judge's own verdict, when the router logged one — lets the
+                # trainer measure judge-teacher agreement, not just teacher-vs-outcome.
+                "judge_verdict": {
+                    "p_solve": record.get("judge_p_solve"),
+                    "capability_boundary": record.get("judge_capability_boundary"),
+                    "minimum_capability": record.get("judge_minimum_capability"),
+                },
                 "outcome": {
                     "model": record.get("model"),
                     "success": record.get("success"),
@@ -255,6 +281,9 @@ def cmd_dream(args: argparse.Namespace) -> None:
         )
     rate = cheap_wrong_rate(records, capable_tiers=set())
     print(f"cheap-but-wrong rate: {rate:.3f}")
+    judged = judge_calibration(records)
+    if any(r.get("judge_p_solve") is not None for r in records):
+        print(f"serving-judge calibration (Brier, lower is better): {judged:.4f}")
 
     if args.strong_model:
         import os

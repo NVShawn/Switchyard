@@ -2242,6 +2242,9 @@ capability_targets = [
         (0.0..=1.0).contains(&reward),
         "reward {reward} out of range"
     );
+    // The served answer record carries the judge's verdict for offline calibration.
+    assert_eq!(answer["judge_p_solve"].as_f64(), Some(0.9));
+    assert_eq!(answer["judge_capability_boundary"], "supported");
 
     let judge = records
         .iter()
