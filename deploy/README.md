@@ -49,6 +49,19 @@ Dream itself writes nothing the server consumes. It is read-only on the log;
 its output (`--out`) is a fine-tune label file for training, not a routing
 input.
 
+## Scheduled dream step (cron)
+
+`deploy/dream_cron.sh` runs the same out-of-band command above on a schedule.
+It reads secrets from `deploy/.env` (gitignored), so the crontab line stays
+clean:
+
+```bash
+0 6,18 * * * /home/<you>/Switchyard/deploy/dream_cron.sh >> /home/<you>/Switchyard/deploy/data/dream_cron.log 2>&1
+```
+
+- Secrets: `deploy/.env` mode `600`, e.g. `NVIDIA_API_KEY=sk-or-...`. `docker compose up` reads the same file automatically.
+- Output: labels to `deploy/data/dream_labels.jsonl`; cron stdout to `deploy/data/dream_cron.log`.
+
 ## Stop
 
 ```bash
