@@ -57,6 +57,11 @@ id = "nvidia/zai-org/glm-5.2"
 llm_client = "nvidia"
 cost = { input_per_1m = 0.5, output_per_1m = 2.0 }
 
+[targets.nemotron_lightning]
+id = "nvidia/nvidia/nemotron-3.5-lightning"
+llm_client = "nvidia"
+cost = { input_per_1m = 0.15, output_per_1m = 0.6 }
+
 
 [routes.gpt_only]
 id = "gpt_only"
@@ -142,6 +147,68 @@ response_schema = '''
 }
 '''
 [routes.auto_cheap_vs_expensive.policy]
+type = "target_selector"
+selector = "/decision/target"
+
+[routes.auto]
+id = "auto"
+type = "llm_classifier"
+mode = "custom"
+classifier_target = "claude_opus"
+targets = ["gpt_strong", "claude_opus", "claude_sonnet", "gpt_nano", "nemotron_nano", "nemotron_ultra", "gpt_sol", "kimi_max", "deepseek_pro", "glm_strong", "nemotron_lightning"]
+default_target = "claude_opus"
+session_affinity = true
+prompt = """
+Select the backend best suited to the request.
+
+- gpt_strong (azure/openai/gpt-5.2): harder reasoning, above cheap but below opus; use for debugging, planning, structured code work, and tasks that require careful reasoning but are not high-risk.
+
+- claude_opus (aws/anthropic/bedrock-claude-opus-4-8): high-risk, ambiguous, or nuanced work; use for the most ambiguous, high-stakes, cross-module, or uncertain tasks where mistakes are costly.
+
+- claude_sonnet (nvidia/nvidia/Nemotron-3-Nano-30B-A3B): efficient mid-tier model; use for general-purpose tasks that benefit from Anthropic's format but don't need Opus-level capability.
+
+- gpt_nano (azure/openai/gpt-5.4-nano): very cheap, fast; use for simple queries, formatting, extraction, and routine assistance.
+
+- nemotron_nano (nvidia/nvidia/nemotron-nano-31b-v3): cheap tier, moderate context window (262K tokens); use for routine chat, light assistance where cost is a primary concern.
+
+- nemotron_ultra (nvidia/nvidia/nemotron-3-ultra): middle tier, large context window (1M tokens); use for more complex reasoning tasks that need more context than nano but not the full capability of opus.
+
+- gpt_sol (azure/openai/gpt-5.6-sol): specialized for coding/software engineering; use for code generation, debugging, and technical tasks.
+
+- kimi_max (nvidia/moonshotai/kimi-k3-max-preview): large context window, strong reasoning; use for long-context analysis and complex reasoning.
+
+- deepseek_pro (nvidia/deepseek-ai/deepseek-v4-pro): strong reasoning, efficient; use for complex reasoning and coding tasks.
+
+- glm_strong (nvidia/zai-org/glm-5.2): strong general capability; use for general-purpose reasoning and chat.
+
+- nemotron_lightning (nvidia/nvidia/nemotron-3.5-lightning): fastest and cheapest Nemotron; use for simple, high-throughput tasks where latency and cost are paramount.
+
+Respond with only a JSON object of the exact form {"decision": {"target": "<name>"}},
+where <name> is one of: gpt_strong, claude_opus, claude_sonnet, gpt_nano, nemotron_nano, nemotron_ultra, gpt_sol, kimi_max, deepseek_pro, glm_strong, nemotron_lightning.
+Add no other keys and no text outside the JSON object.
+"""
+
+response_schema = '''
+{
+  "type": "object",
+  "properties": {
+    "decision": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "enum": ["gpt_strong", "claude_opus", "claude_sonnet", "gpt_nano", "nemotron_nano", "nemotron_ultra", "gpt_sol", "kimi_max", "deepseek_pro", "glm_strong", "nemotron_lightning"]
+        }
+      },
+      "required": ["target"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["decision"],
+  "additionalProperties": false
+}
+'''
+[routes.auto.policy]
 type = "target_selector"
 selector = "/decision/target"
 
