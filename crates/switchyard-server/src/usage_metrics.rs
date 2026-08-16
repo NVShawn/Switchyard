@@ -10,10 +10,16 @@ use opentelemetry::{KeyValue, global};
 use switchyard_protocol::{LlmResponse, LlmResponseChunk, Response, Usage};
 
 use crate::SharedRoutingLog;
-use crate::routing_log::RoutingLogContext;
+use crate::routing_log::{Outcome, RoutingLogContext, compute_reward};
 use crate::stats::{StatsAccumulator, TokenUsage};
+use switchyard_protocol::TargetCost;
 
 /// Observes a routed response without changing its aggregate or streaming contents.
+///
+/// The terminal routing record carries the call's cost, latency, success, and reward so
+/// the feedback loop can learn per-arm outcomes. A mid-stream failure still appends a
+/// record — marked unsuccessful with a zero reward — so the bandit sees the failure.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn observe(
     response: Response,
     model: &str,
@@ -21,6 +27,7 @@ pub(crate) fn observe(
     stats: StatsAccumulator,
     cache_eligible: f64,
     routing_log: Option<(SharedRoutingLog, RoutingLogContext)>,
+    cost: Option<TargetCost>,
 ) -> Response {
     let Response {
         llm_response,
@@ -32,13 +39,27 @@ pub(crate) fn observe(
         LlmResponse::Agg(agg) => {
             record_terminal(&stats, &agg.usage, &model, started, cache_eligible);
             if let Some((log, context)) = routing_log {
-                log.append(context, &model, None, &agg.usage);
+                let latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
+                let cost_usd = cost.and_then(|cost| cost.estimate_usd(&agg.usage));
+                log.append(
+                    context,
+                    &model,
+                    None,
+                    Some(&agg.usage),
+                    Outcome {
+                        cost_usd,
+                        latency_ms: Some(latency_ms),
+                        success: true,
+                        reward: Some(compute_reward(cost_usd, latency_ms, true)),
+                    },
+                );
             }
             LlmResponse::Agg(agg)
         }
         LlmResponse::Stream(mut stream) => {
             let wrapped = async_stream::stream! {
                 let mut latest_usage = None;
+                let mut stream_failed = false;
                 while let Some(item) = stream.next().await {
                     let failed = match &item {
                         Err(_) => true,
@@ -59,16 +80,35 @@ pub(crate) fn observe(
                     }
                     if failed {
                         record_stream_error(&stats, &model);
+                        stream_failed = true;
                     }
                     yield item;
                     if failed {
-                        return;
+                        break;
                     }
                 }
                 let usage = latest_usage.unwrap_or_default();
-                record_terminal(&stats, &usage, &model, started, cache_eligible);
                 if let Some((log, context)) = routing_log {
-                    log.append(context, &model, None, &usage);
+                    let latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
+                    let cost_usd = cost.and_then(|cost| cost.estimate_usd(&usage));
+                    let success = !stream_failed;
+                    log.append(
+                        context,
+                        &model,
+                        None,
+                        Some(&usage),
+                        Outcome {
+                            cost_usd,
+                            latency_ms: Some(latency_ms),
+                            success,
+                            reward: Some(compute_reward(cost_usd, latency_ms, success)),
+                        },
+                    );
+                }
+                // A failed stream already counted its error; only a clean end records
+                // terminal usage and latency.
+                if !stream_failed {
+                    record_terminal(&stats, &usage, &model, started, cache_eligible);
                 }
             };
             LlmResponse::Stream(Box::pin(wrapped))

@@ -37,7 +37,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use switchyard_llm_client::{ClientRouter, RunObservation, RunObserver, TranslatingLlmClient};
-use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
+use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, TargetCost, Usage};
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
 use tracing::{Instrument, Level};
@@ -162,6 +162,10 @@ pub struct ServerState {
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
     track_cache_eligibility: bool,
+    /// Per-model unit pricing, for cost and reward accounting in the routing log.
+    costs: Arc<BTreeMap<ModelId, TargetCost>>,
+    /// Shared bandit state for confidence correction, refreshed from the routing log.
+    bandit: Option<Arc<libsy::ThompsonSampler>>,
 }
 
 #[derive(Clone)]
@@ -183,9 +187,14 @@ impl SharedRoutingLog {
         context: routing_log::RoutingLogContext,
         model: &str,
         tier: Option<&str>,
-        usage: &Usage,
+        usage: Option<&Usage>,
+        outcome: routing_log::Outcome,
     ) {
-        if let Err(error) = self.writer.lock().append(context, model, tier, usage) {
+        if let Err(error) = self
+            .writer
+            .lock()
+            .append(context, model, tier, usage, outcome)
+        {
             tracing::warn!(path = %self.path.display(), %error, "routing log append failed");
         }
     }
@@ -261,6 +270,8 @@ impl ServerState {
             stats,
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
+            costs: Arc::new(BTreeMap::new()),
+            bandit: None,
         })
     }
 
@@ -268,6 +279,18 @@ impl ServerState {
     pub fn with_routing_log(mut self, path: impl Into<PathBuf>) -> ServerResult<Self> {
         self.routing_log = Some(SharedRoutingLog::new(path.into())?);
         Ok(self)
+    }
+
+    /// Sets per-model unit pricing used for cost and reward accounting in the routing log.
+    pub(crate) fn with_target_costs(mut self, costs: BTreeMap<ModelId, TargetCost>) -> Self {
+        self.costs = Arc::new(costs);
+        self
+    }
+
+    /// Sets the shared bandit sampler, refreshed from the routing log at serving time.
+    pub(crate) fn with_bandit(mut self, bandit: Option<Arc<libsy::ThompsonSampler>>) -> Self {
+        self.bandit = bandit;
+        self
     }
 
     /// Returns the route model IDs served by the configured algorithms.
@@ -317,6 +340,52 @@ impl ServerRunOptions {
     }
 }
 
+/// How often the bandit's arms are re-aggregated from the routing log.
+const BANDIT_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Rebuild the bandit's arm priors from the routing log: each arm's `alpha` is the sum
+/// of rewards plus one, `beta` the count minus that sum plus one (floored at one).
+///
+/// The log is the source of truth; the sampler is a pure derive, so replaying it on
+/// every tick keeps restarts and corrections consistent without a separate state file.
+async fn refresh_bandit(sampler: Arc<libsy::ThompsonSampler>, path: PathBuf) {
+    let read_path = path.clone();
+    let read = tokio::task::spawn_blocking(move || routing_log::reward_summary(&read_path)).await;
+    let arms = match read {
+        Ok(Ok(arms)) => arms,
+        Ok(Err(error)) => {
+            tracing::warn!(path = %path.display(), %error, "bandit refresh failed to read the routing log");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "bandit refresh task failed");
+            return;
+        }
+    };
+    for ((model, bucket), summary) in arms {
+        let alpha = summary.sum_reward + 1.0;
+        let beta = (summary.count as f64 - summary.sum_reward + 1.0).max(1.0);
+        sampler.update_arm(&ModelId::from(model), &bucket, alpha, beta);
+    }
+}
+
+/// Starts the bandit refresh loop when a bandit and a routing log are both configured.
+/// The first tick fires immediately, replaying the log so priors survive a restart.
+fn start_bandit_refresh(state: &ServerState) {
+    let (Some(sampler), Some(log)) = (state.bandit.as_ref(), state.routing_log.as_ref()) else {
+        return;
+    };
+    let sampler = Arc::clone(sampler);
+    let path = log.path.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(BANDIT_REFRESH_INTERVAL);
+        loop {
+            interval.tick().await;
+            refresh_bandit(Arc::clone(&sampler), path.clone()).await;
+        }
+    });
+}
+
 /// Validates the runtime and starts the HTTP server unless `dry_run` is set.
 pub async fn run_server(state: ServerState, options: ServerRunOptions) -> ServerResult<()> {
     if options.dry_run {
@@ -360,6 +429,7 @@ impl BoundServer {
         self,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> ServerResult<()> {
+        start_bandit_refresh(&self.state);
         let shutdown_timeout = self.options.shutdown_timeout;
         if let Some(tls) = self.options.tls {
             serve_tls(self.listener, self.router, tls, shutdown_timeout, shutdown).await
@@ -446,28 +516,56 @@ const CLASSIFIER_TIER: &str = "classifier";
 /// configured, so per-session routing snapshots account for judge token overhead. Routed
 /// calls stay off this path: the served call is logged with its terminal usage in
 /// [`usage_metrics::observe`], which would make a second append here a double count.
+/// A *failed* answer call is the exception — observe never runs for it, so it is logged
+/// here with a zero reward, giving the bandit the failure outcome for that arm.
 fn stats_observer(
     stats: StatsAccumulator,
     classifier_log: Option<(SharedRoutingLog, routing_log::RoutingLogContext)>,
+    costs: Arc<BTreeMap<ModelId, TargetCost>>,
 ) -> RunObserver {
     Arc::new(move |observation| match observation {
         RunObservation::LlmCall(call) => {
             let latency_ms = call.duration.as_secs_f64() * 1_000.0;
+            let cost_usd = call
+                .usage
+                .as_ref()
+                .and_then(|usage| costs.get(&call.selected_model)?.estimate_usd(usage));
             if call.is_answer_call {
                 if call.is_success {
                     stats.record_success(&call.selected_model, latency_ms);
                 } else {
                     stats.record_error(&call.selected_model);
+                    if let Some((log, context)) = classifier_log.as_ref() {
+                        log.append(
+                            context.clone(),
+                            call.selected_model.as_str(),
+                            None,
+                            call.usage.as_ref(),
+                            routing_log::Outcome {
+                                cost_usd,
+                                latency_ms: Some(latency_ms),
+                                success: false,
+                                reward: Some(routing_log::compute_reward(
+                                    cost_usd, latency_ms, false,
+                                )),
+                            },
+                        );
+                    }
                 }
             } else if call.is_success {
-                if let (Some((log, context)), Some(usage)) =
-                    (classifier_log.as_ref(), call.usage.as_ref())
-                {
+                if let Some((log, context)) = classifier_log.as_ref() {
                     log.append(
                         context.clone(),
-                        &call.selected_model,
+                        call.selected_model.as_str(),
                         Some(CLASSIFIER_TIER),
-                        usage,
+                        call.usage.as_ref(),
+                        routing_log::Outcome {
+                            cost_usd,
+                            latency_ms: Some(latency_ms),
+                            success: true,
+                            // Classifier calls are not bandit arms, so they carry no reward.
+                            reward: None,
+                        },
                     );
                 }
                 stats.record_classifier_success(
@@ -746,11 +844,16 @@ async fn handle_llm_request(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
+    // Label the bandit's token bucket from the request's estimated size, so both the
+    // served call and any failed answer call log the same arm context.
+    let routing_log_context = routing_log_context
+        .map(|context| context.with_estimated_tokens(estimate_input_tokens(&request)));
     let algorithm = Arc::clone(&route.algorithm);
     let client_router = route.target_clients.clone();
     let observer = stats_observer(
         state.stats.clone(),
         state.routing_log.clone().zip(routing_log_context.clone()),
+        Arc::clone(&state.costs),
     );
     let (trace, response) =
         match switchyard_llm_client::run(algorithm, client_router, request, Some(observer)).await {
@@ -776,6 +879,7 @@ async fn handle_llm_request(
             state.stats,
             cache_eligible,
             state.routing_log.zip(routing_log_context),
+            state.costs.get(served_model).copied(),
         )
     } else {
         response
@@ -790,6 +894,22 @@ async fn handle_llm_request(
         attach_routing_headers(&mut response, served_model.as_str());
     }
     response
+}
+
+/// Rough input-token estimate for bandit bucketing: message text chars / 4.
+///
+/// A coarse proxy is fine here — the bucket only needs to separate small, medium,
+/// and large requests, not count tokens exactly. Tool-call arguments are not text,
+/// so tool-heavy conversations read low; the bucket boundaries absorb that.
+fn estimate_input_tokens(request: &Request) -> u64 {
+    let chars: usize = request
+        .llm_request
+        .messages
+        .iter()
+        .filter_map(|message| message.text_content("\n"))
+        .map(|text| text.len())
+        .sum();
+    (chars / 4) as u64
 }
 
 // Request metadata held until the terminal response determines the event level.
@@ -1371,7 +1491,11 @@ mod tests {
         headers.insert("proxy_x_session_id", "session-1".parse().expect("header"));
         let metadata = metadata_from_headers(headers);
         let context = routing_log::RoutingLogContext::from_metadata(&metadata);
-        let observer = stats_observer(StatsAccumulator::default(), Some((log.clone(), context)));
+        let observer = stats_observer(
+            StatsAccumulator::default(),
+            Some((log.clone(), context)),
+            Arc::new(BTreeMap::new()),
+        );
 
         let call = |model: &str, is_answer_call: bool| {
             RunObservation::LlmCall(LlmCallObservation {

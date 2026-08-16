@@ -1178,7 +1178,6 @@ selector = "/decision/target"
 }
 
 #[tokio::test]
-#[tokio::test]
 async fn custom_classifier_streams_prose_and_tool_calls_from_the_routed_model() -> TestResult {
     // A custom-schema classifier must relay the routed model's response untouched:
     // both the prose that accompanies a tool call and the tool call itself. This
@@ -2157,6 +2156,102 @@ async fn routing_log_prefers_canonical_and_preserves_legacy_fallback() -> TestRe
     Ok(())
 }
 
+/// A capability ladder with per-rung pricing, built from a TOML deployment so the
+/// server threads each target's cost into the routing record.
+#[tokio::test]
+async fn a_routed_call_logs_cost_reward_and_bucket() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config_path = temp_dir.path().join("routes.toml");
+    let log_path = temp_dir.path().join("routing.jsonl");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "{}"
+
+[targets.judge]
+id = "model/classifier"
+llm_client = "primary"
+
+[targets.nano]
+id = "model/nano"
+llm_client = "primary"
+cost = {{ input_per_1m = 0.10, output_per_1m = 0.10 }}
+
+[targets.opus]
+id = "model/opus"
+llm_client = "primary"
+cost = {{ input_per_1m = 3.00, output_per_1m = 3.00 }}
+
+[routes.auto]
+id = "switchyard/auto"
+type = "llm_classifier"
+classifier_target = "judge"
+base_threshold = 0.5
+capability_targets = [
+  {{ target = "nano", capability = 0.2 }},
+  {{ target = "opus", capability = 1.0 }},
+]
+"#,
+            upstream.base_url
+        ),
+    )?;
+    let state = load_server_state(&config_path)?.with_routing_log(&log_path)?;
+    let app = build_switchyard_router(state);
+
+    // The judge returns p_solve 0.9 with no minimum_capability, so the ladder falls
+    // back to the most capable rung (opus).
+    let response = send(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": "switchyard/auto",
+            "messages": [{"role": "user", "content": "hello"}]
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    let records = std::fs::read_to_string(&log_path)?;
+    let records = records
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    // One judge (classifier) record and one answer record for the served rung.
+    let answer = records
+        .iter()
+        .find(|record| record["tier"] != "classifier")
+        .ok_or("no answer record")?;
+    assert_eq!(answer["model"], "model/opus");
+    assert_eq!(answer["success"], true);
+    assert_eq!(answer["token_bucket"], "small");
+    let cost_usd = answer["cost_usd"]
+        .as_f64()
+        .ok_or("answer record has no cost_usd")?;
+    assert!(cost_usd > 0.0, "expected a positive cost, got {cost_usd}");
+    let reward = answer["reward"]
+        .as_f64()
+        .ok_or("answer record has no reward")?;
+    assert!(
+        (0.0..=1.0).contains(&reward),
+        "reward {reward} out of range"
+    );
+
+    let judge = records
+        .iter()
+        .find(|record| record["tier"] == "classifier")
+        .ok_or("no judge record")?;
+    // The judge call is not a bandit arm, so it carries no reward.
+    assert!(judge.get("reward").is_none() || judge["reward"].is_null());
+    Ok(())
+}
+
 #[tokio::test]
 async fn routing_log_keeps_the_canonical_session_id_until_a_stream_drains() -> TestResult {
     let upstream = MockUpstream::start().await?;
@@ -2262,10 +2357,21 @@ async fn unavailable_target_fails_over_across_endpoints_and_stops_when_exhausted
         .lines()
         .map(serde_json::from_str::<Value>)
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(records.len(), 3);
-    assert!(records.iter().all(|record| {
-        record["model"] == "model/strong" && record.get("fallback_reason").is_none()
-    }));
+    // Each request logs two answer-call outcomes: the failed weak arm and the served
+    // strong arm, so the feedback loop sees both the failure and the fallback success.
+    assert_eq!(records.len(), 6);
+    let weak: Vec<_> = records
+        .iter()
+        .filter(|record| record["model"] == "model/weak")
+        .collect();
+    let strong: Vec<_> = records
+        .iter()
+        .filter(|record| record["model"] == "model/strong")
+        .collect();
+    assert_eq!(weak.len(), 3);
+    assert!(weak.iter().all(|record| record["success"] == false));
+    assert_eq!(strong.len(), 3);
+    assert!(strong.iter().all(|record| record["success"] == true));
 
     let previous_call_count = upstream.calls.lock().await.len();
     let response = send(

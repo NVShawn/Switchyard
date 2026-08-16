@@ -15,8 +15,8 @@ pub use error::{DriverError, LibsyError, Result};
 
 mod algorithms;
 pub use algorithms::llm_class::{
-    CapabilityTarget, CustomClassifierConfig, CustomClassifierPolicy, LlmClassifierConfig,
-    LlmTaskClassifier, TaskClassifierConfig, ZoneConfig,
+    BanditConfig, CapabilityTarget, CustomClassifierConfig, CustomClassifierPolicy,
+    LlmClassifierConfig, LlmTaskClassifier, TaskClassifierConfig, ZoneConfig,
 };
 pub use algorithms::noop::Noop;
 pub use algorithms::passthrough::Passthrough;
@@ -29,6 +29,7 @@ pub use algorithms::util::classifier_contract::{
 pub use algorithms::util::escalation::EscalationJudgeConfig;
 pub use algorithms::util::prompts::{SystemPromptProcessor, TargetPrompts, append_note};
 pub use algorithms::util::subagent::SubagentOverride;
+pub use algorithms::util::thompson::{ThompsonSampler, estimate_request_tokens, token_bucket};
 pub use algorithms::util::tool_signals::{DEFAULT_RECENT_WINDOW, ToolSignals};
 
 // Stage-router scoring and tier selection — the shared signal-driven routing

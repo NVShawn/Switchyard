@@ -103,6 +103,21 @@ impl ServerConfig {
 
         let clients = self.build_clients()?;
         let targets = self.build_targets()?;
+        // One bandit sampler is shared by every bandit-enabled route; the refresh loop
+        // rebuilds its arms from the routing log. Created only when a route opts in.
+        let bandit_sampler = self
+            .routes
+            .values()
+            .any(|route| {
+                matches!(
+                    route,
+                    RouteConfig::LlmClassifier {
+                        bandit: Some(_),
+                        ..
+                    }
+                )
+            })
+            .then(|| Arc::new(libsy::ThompsonSampler::new()));
         let mut routes = Vec::with_capacity(self.routes.len());
         for (route_name, config) in &self.routes {
             validate_value("route name", route_name)?;
@@ -113,7 +128,8 @@ impl ServerConfig {
                     "route {route_name} context_window must be greater than zero"
                 )));
             }
-            let algorithm = build_algorithm(route_name, config, &targets, &self.targets)?;
+            let algorithm =
+                build_algorithm(route_name, config, &targets, &self.targets, &bandit_sampler)?;
             let (client, caller_auth) = self.build_route_clients(route_name, config, &clients)?;
             let count_tokens_target = self.build_count_tokens_target(config, &clients);
             routes.push((
@@ -125,7 +141,14 @@ impl ServerConfig {
                 count_tokens_target,
             ));
         }
+        // Per-model unit pricing for cost and reward accounting in the routing log.
+        let costs = self
+            .targets
+            .values()
+            .filter_map(|target| target.cost.map(|cost| (target.id.clone(), cost)))
+            .collect();
         ServerState::new_with_capabilities(routes)
+            .map(|state| state.with_target_costs(costs).with_bandit(bandit_sampler))
     }
 
     fn build_clients(&self) -> ServerResult<BTreeMap<String, Arc<TranslatingLlmClient>>> {
@@ -339,6 +362,17 @@ struct ZoneConfigToml {
     output_judge_max_output_tokens: u64,
 }
 
+/// Thompson-sampling correction to the judge's confidence (`[routes.x.bandit]`).
+///
+/// Presence enables the bandit; its arms are refreshed from the routing log. Requires
+/// a capability ladder with zones, since the correction acts on zone confidence.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BanditConfigToml {
+    /// How far one sample can move `p_solve`: `corrected = p_solve + (sample - 0.5) * scale`.
+    scale: f64,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ClassifierMode {
@@ -378,6 +412,8 @@ struct CapabilityClassifierRouteConfig {
     capability_targets: Vec<CapabilityTargetConfig>,
     /// Confidence zones and fan-out; only valid with a capability ladder.
     zones: Option<ZoneConfigToml>,
+    /// Thompson-sampling confidence correction; requires zones.
+    bandit: Option<BanditConfigToml>,
 }
 
 #[derive(Debug)]
@@ -484,6 +520,9 @@ enum RouteConfig {
         /// Confidence zones and fan-out for a capability ladder.
         #[serde(default)]
         zones: Option<ZoneConfigToml>,
+        /// Thompson-sampling confidence correction, refreshed from the routing log.
+        #[serde(default)]
+        bandit: Option<BanditConfigToml>,
     },
     StageRouter {
         id: ModelId,
@@ -697,6 +736,7 @@ impl RouteConfig {
             policy,
             capability_targets,
             zones,
+            bandit,
             ..
         } = self
         else {
@@ -743,9 +783,12 @@ impl RouteConfig {
                         required_classifier_field(route_name, "weak_target", weak_target)?,
                     )
                 } else {
-                    let by_capability = |a: &&CapabilityTargetConfig, b: &&CapabilityTargetConfig| {
-                        a.capability.partial_cmp(&b.capability).unwrap_or(std::cmp::Ordering::Equal)
-                    };
+                    let by_capability =
+                        |a: &&CapabilityTargetConfig, b: &&CapabilityTargetConfig| {
+                            a.capability
+                                .partial_cmp(&b.capability)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        };
                     let weakest = capability_targets
                         .iter()
                         .min_by(by_capability)
@@ -787,6 +830,18 @@ impl RouteConfig {
                         )));
                     }
                 }
+                if let Some(bandit_config) = bandit {
+                    if zones.is_none() {
+                        return Err(ServerError::new(format!(
+                            "llm_classifier route {route_name} bandit requires zones"
+                        )));
+                    }
+                    if !bandit_config.scale.is_finite() || bandit_config.scale < 0.0 {
+                        return Err(ServerError::new(format!(
+                            "llm_classifier route {route_name} bandit scale must be a non-negative finite number"
+                        )));
+                    }
+                }
                 Ok(LlmClassifierModeConfig::Capability(
                     CapabilityClassifierRouteConfig {
                         strong_target,
@@ -805,6 +860,7 @@ impl RouteConfig {
                         max_output_tokens: *max_output_tokens,
                         capability_targets,
                         zones: zones.clone(),
+                        bandit: *bandit,
                     },
                 ))
             }
@@ -826,6 +882,9 @@ impl RouteConfig {
                 }
                 if zones.is_some() {
                     return Err(classifier_field_error(route_name, "zones", "escalation"));
+                }
+                if bandit.is_some() {
+                    return Err(classifier_field_error(route_name, "bandit", "escalation"));
                 }
                 if mode.is_some()
                     && (base_threshold.is_some()
@@ -865,6 +924,7 @@ impl RouteConfig {
                     || escalation.is_some()
                     || capability_targets.is_some()
                     || zones.is_some()
+                    || bandit.is_some()
                     || *response_format_type != ClassifierResponseFormat::JsonSchema
                 {
                     return Err(ServerError::new(format!(
@@ -1004,6 +1064,7 @@ fn build_algorithm(
     config: &RouteConfig,
     targets: &BTreeMap<String, ModelId>,
     target_configs: &BTreeMap<String, TargetConfig>,
+    bandit_sampler: &Option<Arc<libsy::ThompsonSampler>>,
 ) -> ServerResult<Arc<dyn Algorithm>> {
     match config {
         RouteConfig::Noop { .. } => Ok(Arc::new(Noop {})),
@@ -1083,6 +1144,19 @@ fn build_algorithm(
                             })
                         })
                         .transpose()?;
+                    // The bandit shares the server-wide sampler; `scale` is per route.
+                    let bandit = match (&config.bandit, bandit_sampler) {
+                        (Some(bandit_config), Some(sampler)) => Some(libsy::BanditConfig {
+                            sampler: Arc::clone(sampler),
+                            scale: bandit_config.scale,
+                        }),
+                        (Some(_), None) => {
+                            return Err(ServerError::new(format!(
+                                "llm_classifier route {route_name} bandit needs a shared sampler"
+                            )));
+                        }
+                        _ => None,
+                    };
                     let classifier_config = TaskClassifierConfig {
                         base_threshold: config.base_threshold,
                         threshold_step: config.threshold_step,
@@ -1099,6 +1173,7 @@ fn build_algorithm(
                         capable_target: strong,
                         capability_targets,
                         capability_zones,
+                        bandit,
                         config: classifier_config,
                     })
                 }
@@ -1466,14 +1541,13 @@ capability_targets = [
 ]
 "#;
 
-        #[test]
+    #[test]
     fn a_capability_ladder_builds_cost_aware_routing() -> ServerResult<()> {
         // The ladder parses and builds; strong/weak default to the ladder endpoints.
         let state = server_state_from_toml(LADDER_CONFIG)?;
         assert_eq!(state.models().collect::<Vec<_>>(), ["switchyard/ladder"]);
         Ok(())
     }
-
 
     #[test]
     fn a_capability_ladder_requires_a_cost_on_every_rung() {
@@ -1485,7 +1559,6 @@ capability_targets = [
         assert!(error_message(&missing_cost).contains("has no cost"));
     }
 
-
     #[test]
     fn a_capability_ladder_rejects_an_out_of_range_capability() {
         let out_of_range = LADDER_CONFIG.replace(
@@ -1494,7 +1567,6 @@ capability_targets = [
         );
         assert!(error_message(&out_of_range).contains("must be between 0 and 1"));
     }
-
 
     #[test]
     fn capability_targets_are_rejected_in_escalation_and_custom_modes() {
@@ -1536,7 +1608,6 @@ output_judge_target = "judge"
         Ok(())
     }
 
-
     #[test]
     fn zones_require_a_capability_ladder() {
         // Zones on the binary strong/weak route have no ladder to fan out over.
@@ -1552,7 +1623,6 @@ output_judge_target = "classifier"
         assert!(error_message(&zones_without_ladder).contains("zones requires capability_targets"));
     }
 
-
     #[test]
     fn zones_reject_inverted_thresholds_and_zero_fan_out() {
         let inverted = zoned_ladder().replace("low_threshold = 0.3", "low_threshold = 0.9");
@@ -1561,7 +1631,6 @@ output_judge_target = "classifier"
         let zero_fan_out = zoned_ladder().replace("fan_out = 3", "fan_out = 0");
         assert!(error_message(&zero_fan_out).contains("fan_out must be at least 1"));
     }
-
 
     #[test]
     fn zones_are_rejected_in_escalation_mode() {
@@ -1578,8 +1647,36 @@ output_judge_target = "classifier"
         assert!(error_message(&escalation).contains("mode escalation cannot use zones"));
     }
 
+    #[test]
+    fn a_bandit_builds_with_a_zoned_ladder() -> ServerResult<()> {
+        let bandit = zoned_ladder()
+            + r#"
+[routes.ladder.bandit]
+scale = 0.5
+"#;
+        let state = server_state_from_toml(&bandit)?;
+        assert_eq!(state.models().collect::<Vec<_>>(), ["switchyard/ladder"]);
+        Ok(())
+    }
 
+    #[test]
+    fn a_bandit_requires_zones_and_a_finite_scale() {
+        // A bandit without zones has nothing to correct.
+        let no_zones = format!(
+            r#"{LADDER_CONFIG}
+[routes.ladder.bandit]
+scale = 0.5
+"#
+        );
+        assert!(error_message(&no_zones).contains("bandit requires zones"));
 
+        let bad_scale = zoned_ladder()
+            + r#"
+[routes.ladder.bandit]
+scale = -0.5
+"#;
+        assert!(error_message(&bad_scale).contains("bandit scale must be a non-negative finite"));
+    }
 
     #[test]
     fn rejects_unknown_fields_and_algorithm_types() {
@@ -1826,40 +1923,6 @@ target = "azure"
         Ok(())
     }
 
-#[test]
-    fn target_cost_is_parsed_when_configured() -> ServerResult<()> {
-        let configured = VALID_CONFIG.replacen(
-            "llm_client = \"primary\"",
-            "llm_client = \"primary\"\ncost = { input_per_1m = 0.5, output_per_1m = 2.0 }",
-            1,
-        );
-        let config: ServerConfig = toml::from_str(&configured)
-            .map_err(|error| ServerError::new(format!("failed to parse config: {error}")))?;
-        let Some(target) = config.targets.get("classifier") else {
-            return Err(ServerError::new("classifier target is missing"));
-        };
-        assert_eq!(
-            target.cost,
-            Some(TargetCost {
-                input_per_1m: 0.5,
-                output_per_1m: 2.0,
-            })
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn target_cost_rejects_negative_prices() {
-        assert!(
-            error_message(&VALID_CONFIG.replacen(
-                "llm_client = \"primary\"",
-                "llm_client = \"primary\"\ncost = { input_per_1m = -0.5, output_per_1m = 1.0 }",
-                1,
-            ))
-            .contains("cost input_per_1m must be a non-negative finite number")
-        );
-    }
-
     #[test]
     fn target_extra_body_is_parsed_and_applied_to_its_backend() -> ServerResult<()> {
         let configured = VALID_CONFIG.replacen(
@@ -1891,6 +1954,40 @@ target = "azure"
             Some(&json!(false))
         );
         Ok(())
+    }
+
+    #[test]
+    fn target_cost_is_parsed_when_configured() -> ServerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "llm_client = \"primary\"",
+            "llm_client = \"primary\"\ncost = { input_per_1m = 0.5, output_per_1m = 2.0 }",
+            1,
+        );
+        let config: ServerConfig = toml::from_str(&configured)
+            .map_err(|error| ServerError::new(format!("failed to parse config: {error}")))?;
+        let Some(target) = config.targets.get("classifier") else {
+            return Err(ServerError::new("classifier target is missing"));
+        };
+        assert_eq!(
+            target.cost,
+            Some(TargetCost {
+                input_per_1m: 0.5,
+                output_per_1m: 2.0,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn target_cost_rejects_negative_prices() {
+        assert!(
+            error_message(&VALID_CONFIG.replacen(
+                "llm_client = \"primary\"",
+                "llm_client = \"primary\"\ncost = { input_per_1m = -0.5, output_per_1m = 1.0 }",
+                1,
+            ))
+            .contains("cost input_per_1m must be a non-negative finite number")
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@ use super::util::llm_judge::{
     SerdeDecoder, StructuredJudge,
 };
 use super::util::target_selector::TargetSelectorPolicy;
+use super::util::thompson::{ThompsonSampler, estimate_request_tokens, token_bucket};
 use crate::core::algorithm::{self, Algorithm, Driver};
 use crate::core::classifier::{Classification, Classifier, Score};
 use crate::core::state::{State, StateValue};
@@ -669,6 +670,18 @@ enum Zone {
     FanOut,
 }
 
+/// Optional Thompson-sampling correction to the judge's confidence, learned from
+/// observed per-arm rewards. The sampler is shared with the host's refresh loop.
+///
+/// The bandit never replaces the judge: it only shifts `p_solve` before zone
+/// classification, so removing it is a config flip, not a refactor.
+pub struct BanditConfig {
+    /// Shared bandit state over `(target, token bucket)` arms.
+    pub sampler: Arc<ThompsonSampler>,
+    /// How far one sample can move `p_solve`: `corrected = p_solve + (sample - 0.5) * scale`.
+    pub scale: f64,
+}
+
 /// Routes among a cost-ascending capability ladder, optionally fanning out over the
 /// mid-confidence zone and judging the candidates' answers with an output judge.
 struct CostAwareClassifier {
@@ -678,6 +691,8 @@ struct CostAwareClassifier {
     /// The most capable rung: Zone C's target and the cascade's fallback.
     capable_target: ModelId,
     zones: Option<ZoneRuntime>,
+    /// Optional bandit correction to the judge's confidence.
+    bandit: Option<BanditConfig>,
 }
 
 #[async_trait]
@@ -704,7 +719,11 @@ impl Classifier<State> for CostAwareClassifier {
                 None,
             ));
         };
-        match Self::zone(&verdict, zones) {
+        // The bandit nudges the judge's confidence from the cheapest adequate rung's
+        // observed rewards before the zone decision — a failing cheap tier drops toward
+        // fan-out or the capable rung.
+        let p_solve = self.corrected_p_solve(&verdict, request);
+        match Self::zone(p_solve, &verdict, zones) {
             Zone::Answer => Ok((
                 self.classifier.policy().to_classification(Some(&verdict)),
                 None,
@@ -716,19 +735,46 @@ impl Classifier<State> for CostAwareClassifier {
 }
 
 impl CostAwareClassifier {
-    /// Maps a validated verdict to its zone. An unsupported boundary is always Zone C:
-    /// the judge already distrusts the cheap tiers, whatever p_solve says.
-    fn zone(verdict: &TaskClassifierVerdict, zones: &ZoneRuntime) -> Zone {
+    /// Maps a (possibly bandit-corrected) confidence to its zone. An unsupported boundary
+    /// is always Zone C: the judge already distrusts the cheap tiers, whatever p_solve says.
+    fn zone(p_solve: f64, verdict: &TaskClassifierVerdict, zones: &ZoneRuntime) -> Zone {
         if verdict.capability_boundary == "unsupported" {
             return Zone::Capable;
         }
-        if verdict.p_solve >= zones.high_threshold {
+        if p_solve >= zones.high_threshold {
             Zone::Answer
-        } else if verdict.p_solve < zones.low_threshold {
+        } else if p_solve < zones.low_threshold {
             Zone::Capable
         } else {
             Zone::FanOut
         }
+    }
+
+    /// The cheapest rung clearing the judge's level — the Zone A candidate whose arm
+    /// corrects the confidence. Without a level, the cheapest rung overall.
+    fn cheapest_eligible(&self, verdict: &TaskClassifierVerdict) -> Option<&ModelId> {
+        match verdict.minimum_capability {
+            Some(required) => self
+                .ranked
+                .iter()
+                .find(|rung| rung.capability >= required)
+                .map(|rung| &rung.target),
+            None => self.ranked.first().map(|rung| &rung.target),
+        }
+    }
+
+    /// The judge's `p_solve`, nudged by the bandit arm of the cheapest adequate rung.
+    fn corrected_p_solve(&self, verdict: &TaskClassifierVerdict, request: &Request) -> f64 {
+        let Some(bandit) = &self.bandit else {
+            return verdict.p_solve;
+        };
+        let Some(cheapest) = self.cheapest_eligible(verdict) else {
+            return verdict.p_solve;
+        };
+        let sample = bandit
+            .sampler
+            .sample(cheapest, token_bucket(estimate_request_tokens(request)));
+        (verdict.p_solve + (sample - 0.5) * bandit.scale).clamp(0.0, 1.0)
     }
 
     /// Zone B: call the cheapest eligible rungs concurrently, buffer their answers, and
@@ -1062,6 +1108,9 @@ pub enum LlmClassifierConfig {
         /// Confidence zones and fan-out. Only valid with a `capability_targets` ladder;
         /// `None` makes every ranked pick a single call.
         capability_zones: Option<ZoneConfig>,
+        /// Optional Thompson-sampling correction to the judge's confidence, learned from
+        /// observed rewards. Only applies when `capability_zones` is set.
+        bandit: Option<BanditConfig>,
         /// Capability classifier settings.
         config: TaskClassifierConfig,
     },
@@ -1108,6 +1157,7 @@ impl LlmTaskClassifier {
                 capable_target,
                 capability_targets,
                 capability_zones,
+                bandit,
                 config,
             } => Self::build_capability(
                 judge_target,
@@ -1115,6 +1165,7 @@ impl LlmTaskClassifier {
                 capable_target,
                 capability_targets,
                 capability_zones,
+                bandit,
                 config,
             ),
             LlmClassifierConfig::Escalation {
@@ -1147,13 +1198,20 @@ impl LlmTaskClassifier {
         capable_target: ModelId,
         capability_targets: Vec<CapabilityTarget>,
         capability_zones: Option<ZoneConfig>,
+        bandit: Option<BanditConfig>,
         config: TaskClassifierConfig,
     ) -> Result<Self> {
         config.validate()?;
         // Zones need a ladder to fan out over; they are meaningless for the binary pair.
+        // The bandit only corrects zone confidence, so it needs zones to act on.
         if capability_zones.is_some() && capability_targets.is_empty() {
             return Err(LibsyError::AlgorithmError {
                 message: "capability_zones requires a capability_targets ladder".to_string(),
+            });
+        }
+        if bandit.is_some() && capability_zones.is_none() {
+            return Err(LibsyError::AlgorithmError {
+                message: "bandit correction requires capability_zones".to_string(),
             });
         }
         // Validate and order the ladder cheapest-first. An empty ladder keeps the binary
@@ -1235,6 +1293,7 @@ impl LlmTaskClassifier {
                         ranked,
                         capable_target: default,
                         zones,
+                        bandit,
                     }),
                 )
             };
@@ -1628,6 +1687,7 @@ mod tests {
                 capable_target: ModelId::from("capable"),
                 capability_targets: Vec::new(),
                 capability_zones: None,
+                bandit: None,
                 config: test_config(TEST_THRESHOLD),
             },
         )?))
@@ -1715,6 +1775,7 @@ mod tests {
             capable_target: ModelId::from("capable"),
             capability_targets: Vec::new(),
             capability_zones: None,
+            bandit: None,
             config: TaskClassifierConfig {
                 max_output_tokens: 512,
                 ..test_config(TEST_THRESHOLD)
@@ -1736,6 +1797,7 @@ mod tests {
             capable_target: ModelId::from("capable"),
             capability_targets: Vec::new(),
             capability_zones: None,
+            bandit: None,
             config: TaskClassifierConfig {
                 contract: ClassifierContractConfig::default()
                     .with_prompt("Custom capability rubric."),
@@ -1760,6 +1822,7 @@ mod tests {
             capable_target: ModelId::from("capable"),
             capability_targets: Vec::new(),
             capability_zones: None,
+            bandit: None,
             config: TaskClassifierConfig {
                 session_affinity: true,
                 ..test_config(TEST_THRESHOLD)
@@ -1783,6 +1846,7 @@ mod tests {
             capable_target: ModelId::from("capable"),
             capability_targets: Vec::new(),
             capability_zones: None,
+            bandit: None,
             config: TaskClassifierConfig {
                 session_affinity: true,
                 message_hash_fallback: true,
@@ -1849,7 +1913,8 @@ mod tests {
                     capable_target: ModelId::from("c"),
                     capability_targets: Vec::new(),
                     capability_zones: None,
-                        config: test_config(bad),
+                    bandit: None,
+                    config: test_config(bad),
                 })
                 .is_err(),
                 "base threshold {bad} should be rejected"
@@ -1884,7 +1949,8 @@ mod tests {
                     capable_target: ModelId::from("c"),
                     capability_targets: Vec::new(),
                     capability_zones: None,
-                        config,
+                    bandit: None,
+                    config,
                 })
                 .is_err()
             );
@@ -1896,6 +1962,7 @@ mod tests {
                 capable_target: ModelId::from("c"),
                 capability_targets: Vec::new(),
                 capability_zones: None,
+                bandit: None,
                 config: test_config(base_threshold),
             })?;
         }
@@ -2061,6 +2128,7 @@ mod tests {
                 rung("mid", 0.5, 0.4),
             ],
             capability_zones: None,
+            bandit: None,
             config: test_config(TEST_THRESHOLD),
         })?;
         let _ = router;
@@ -2105,6 +2173,7 @@ mod tests {
                 capable_target: ModelId::from("c"),
                 capability_targets: vec![rung("only", 0.5)],
                 capability_zones: None,
+                bandit: None,
                 config: test_config(TEST_THRESHOLD),
             })
             .is_err()
@@ -2117,6 +2186,7 @@ mod tests {
                 capable_target: ModelId::from("c"),
                 capability_targets: vec![rung("a", 0.5), rung("b", 1.5)],
                 capability_zones: None,
+                bandit: None,
                 config: test_config(TEST_THRESHOLD),
             })
             .is_err()
@@ -2161,6 +2231,7 @@ mod tests {
                     cost_rung("opus", 1.0, 3.0),
                 ],
                 capability_zones: Some(test_zones()),
+                bandit: None,
                 config: test_config(TEST_THRESHOLD),
             },
         )?))
@@ -2341,6 +2412,73 @@ mod tests {
             response.llm_response.as_agg().map(completion_text),
             Some("answer from nano".to_string())
         );
+        Ok(())
+    }
+
+    /// A zoned router with a bandit over the shared `sampler`.
+    fn bandit_router(sampler: Arc<ThompsonSampler>, scale: f64) -> Result<Arc<LlmTaskClassifier>> {
+        let mut zones = test_zones();
+        // Keep Zone B out of the way so the correction's effect is a clean A↔C shift.
+        zones.low_threshold = 0.3;
+        zones.high_threshold = 0.7;
+        Ok(Arc::new(LlmTaskClassifier::new(
+            LlmClassifierConfig::Capability {
+                judge_target: ModelId::from("judge"),
+                efficient_target: ModelId::from("nano"),
+                capable_target: ModelId::from("opus"),
+                capability_targets: vec![
+                    cost_rung("nano", 0.2, 0.1),
+                    cost_rung("strong", 0.5, 0.5),
+                    cost_rung("ultra", 0.8, 1.0),
+                    cost_rung("opus", 1.0, 3.0),
+                ],
+                capability_zones: Some(zones),
+                bandit: Some(BanditConfig { sampler, scale }),
+                config: test_config(TEST_THRESHOLD),
+            },
+        )?))
+    }
+
+    #[tokio::test]
+    async fn a_failing_cheap_arm_pushes_the_route_off_zone_a() -> Result<()> {
+        // The judge is confident (Zone A territory), but nano's arm has only failures,
+        // so the corrected confidence drops below the low threshold and the route lands
+        // on the most capable rung instead.
+        let sampler = Arc::new(ThompsonSampler::new());
+        // A hundred failures: Beta(1, 101) samples sit near 0.01, deterministically
+        // dragging 0.75 + (0.01 - 0.5) * 1.0 below the 0.3 low threshold.
+        sampler.update_arm(&ModelId::from("nano"), "small", 1.0, 101.0);
+        let router = bandit_router(sampler, 1.0)?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let serve = recording_zone_serve(Arc::clone(&calls), 0.75, "supported", 0.2, 0);
+
+        let (_trace, response) = test_drive(router, classify_request(), serve).await?;
+
+        assert_eq!(
+            response.llm_response.as_agg().map(completion_text),
+            Some("answer from opus".to_string())
+        );
+        assert_eq!(*calls.lock(), vec!["judge".to_string(), "opus".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_succeeding_cheap_arm_keeps_the_route_cheap() -> Result<()> {
+        // A hundred successes: Beta(101, 1) samples near 0.99, pushing the corrected
+        // confidence up, so the route stays on the cheap rung.
+        let sampler = Arc::new(ThompsonSampler::new());
+        sampler.update_arm(&ModelId::from("nano"), "small", 101.0, 1.0);
+        let router = bandit_router(sampler, 1.0)?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let serve = recording_zone_serve(Arc::clone(&calls), 0.75, "supported", 0.2, 0);
+
+        let (_trace, response) = test_drive(router, classify_request(), serve).await?;
+
+        assert_eq!(
+            response.llm_response.as_agg().map(completion_text),
+            Some("answer from nano".to_string())
+        );
+        assert_eq!(*calls.lock(), vec!["judge".to_string(), "nano".to_string()]);
         Ok(())
     }
 

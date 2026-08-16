@@ -493,6 +493,7 @@ fn classifier_router(
             capable_target: ModelId::from(capable_model),
             capability_targets: Vec::new(),
             capability_zones: None,
+            bandit: None,
             config: TaskClassifierConfig {
                 base_threshold: 0.5,
                 ..TaskClassifierConfig::default()

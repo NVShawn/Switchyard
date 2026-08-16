@@ -21,6 +21,52 @@ const LEGACY_SESSION_ID_HEADER: &str = "proxy_x_session_id";
 const TASK_HEADER: &str = "x-switchyard-intake-task";
 const TRIAL_ID_HEADER: &str = "x-switchyard-trial-id";
 
+/// Tier label written for judge/classifier calls, which are not bandit arms.
+const CLASSIFIER_TIER: &str = "classifier";
+
+/// Reward normalization: this USD cost maps to a fully "expensive" call.
+const REWARD_COST_SCALE_USD: f64 = 0.1;
+/// Reward normalization: the latency budget a call is measured against.
+const REWARD_LATENCY_BUDGET_MS: f64 = 20_000.0;
+
+/// The terminal outcome of one routed or classifier call, for reward accounting.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Outcome {
+    /// Estimated USD spent, when the target has a cost and usage was reported.
+    pub(crate) cost_usd: Option<f64>,
+    /// Wall-clock latency of the call, when measured.
+    pub(crate) latency_ms: Option<f64>,
+    /// Whether the call completed without a transport or upstream error.
+    pub(crate) success: bool,
+    /// Normalized 0..1 reward. `None` for classifier calls, which are not bandit arms.
+    pub(crate) reward: Option<f64>,
+}
+
+/// Computes a 0..1 reward from cost and latency, blended with a success bonus.
+///
+/// A failed call scores 0.0 — the cost and latency were spent without a usable
+/// answer, so there is no partial credit. The blend mirrors TokenHub's
+/// cost/latency/success weighting.
+pub(crate) fn compute_reward(cost_usd: Option<f64>, latency_ms: f64, success: bool) -> f64 {
+    if !success {
+        return 0.0;
+    }
+    let cost_norm = (cost_usd.unwrap_or(0.0) / REWARD_COST_SCALE_USD).min(1.0);
+    let latency_norm = (latency_ms / REWARD_LATENCY_BUDGET_MS).min(1.0);
+    (1.0 - cost_norm) * 0.3 + (1.0 - latency_norm) * 0.3 + 0.4
+}
+
+/// Coarse token bucket for bandit context, labelled from an estimated token count.
+pub(crate) fn token_bucket(estimated_tokens: u64) -> &'static str {
+    if estimated_tokens < 1_000 {
+        "small"
+    } else if estimated_tokens <= 10_000 {
+        "medium"
+    } else {
+        "large"
+    }
+}
+
 /// Append-only writer for one routing JSONL file.
 pub(crate) struct RoutingLog(fs::File);
 
@@ -46,9 +92,10 @@ impl RoutingLog {
         context: RoutingLogContext,
         model: &str,
         tier: Option<&str>,
-        usage: &Usage,
+        usage: Option<&Usage>,
+        outcome: Outcome,
     ) -> std::io::Result<()> {
-        let usage = token_usage(usage);
+        let usage = usage.map(token_usage).unwrap_or_default();
         let record = RoutingRecord {
             ts: format_rfc3339_millis(SystemTime::now()).to_string().into(),
             task: context.task.map(Cow::Owned),
@@ -62,6 +109,11 @@ impl RoutingLog {
             completion_tokens: usage.completion_tokens,
             reasoning_tokens: usage.reasoning_tokens,
             total_tokens: usage.prompt_tokens.saturating_add(usage.completion_tokens),
+            cost_usd: outcome.cost_usd,
+            latency_ms: outcome.latency_ms,
+            success: Some(outcome.success),
+            reward: outcome.reward,
+            token_bucket: context.token_bucket.map(Cow::Owned),
         };
         let mut line = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
         line.push(b'\n');
@@ -95,12 +147,64 @@ pub(crate) fn snapshot(
     Ok((snapshot.total_calls > 0).then_some(snapshot))
 }
 
+/// Aggregated reward for one bandit arm — a (model, token bucket) pair.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RewardSummary {
+    /// Number of answer calls recorded for the arm.
+    pub(crate) count: u64,
+    /// Sum of their rewards (soft success count for the Beta prior).
+    pub(crate) sum_reward: f64,
+}
+
+/// Aggregates answer-call rewards per (model, token bucket) arm from the log.
+///
+/// Only answer calls carry a reward, so classifier calls and legacy records are
+/// skipped. This is the read side of the feedback loop: replayed at startup and
+/// re-aggregated on the refresh interval to rebuild the bandit's priors.
+pub(crate) fn reward_summary(
+    path: &Path,
+) -> std::io::Result<std::collections::BTreeMap<(String, String), RewardSummary>> {
+    let mut reader = BufReader::with_capacity(64 * 1024, fs::File::open(path)?);
+    let mut line = Vec::new();
+    let mut arms: std::collections::BTreeMap<(String, String), RewardSummary> =
+        std::collections::BTreeMap::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        let Ok(record) = serde_json::from_slice::<RoutingRecord>(&line) else {
+            continue;
+        };
+        // Only completed answer calls with a reward and a bucket are arm outcomes.
+        let (Some(reward), Some(bucket)) = (record.reward, record.token_bucket.as_deref()) else {
+            continue;
+        };
+        if record.model.is_empty() || record.tier == CLASSIFIER_TIER {
+            continue;
+        }
+        let arm = arms
+            .entry((record.model.into_owned(), bucket.to_string()))
+            .or_insert(RewardSummary {
+                count: 0,
+                sum_reward: 0.0,
+            });
+        arm.count = arm.count.saturating_add(1);
+        arm.sum_reward += reward;
+    }
+    Ok(arms)
+}
+
 /// Request fields retained until terminal usage and routing are available.
 #[derive(Clone)]
 pub(crate) struct RoutingLogContext {
     task: Option<String>,
     trial_id: Option<String>,
     session_id: Option<String>,
+    token_bucket: Option<String>,
 }
 
 impl RoutingLogContext {
@@ -119,7 +223,14 @@ impl RoutingLogContext {
                     .and_then(|headers| nonempty_header(headers, LEGACY_SESSION_ID_HEADER))
                     .map(str::to_string)
             }),
+            token_bucket: None,
         }
+    }
+
+    /// Records the bandit's token bucket, labelled from the request's estimated size.
+    pub(crate) fn with_estimated_tokens(mut self, estimated_tokens: u64) -> Self {
+        self.token_bucket = Some(token_bucket(estimated_tokens).to_string());
+        self
     }
 }
 
@@ -144,6 +255,17 @@ struct RoutingRecord<'a> {
     completion_tokens: u64,
     reasoning_tokens: u64,
     total_tokens: u64,
+    /// Estimated USD spent, when the target has a cost and usage was reported.
+    cost_usd: Option<f64>,
+    /// Wall-clock latency of the call, when measured.
+    latency_ms: Option<f64>,
+    /// Terminal success; `None` on legacy records written before this field existed.
+    success: Option<bool>,
+    /// Normalized 0..1 reward for answer calls; `None` for classifier calls and legacy records.
+    reward: Option<f64>,
+    /// Bandit token bucket, when the request size was estimated.
+    #[serde(borrow)]
+    token_bucket: Option<Cow<'a, str>>,
 }
 
 /// Session totals returned by the routing stats endpoint.
@@ -182,6 +304,12 @@ impl SessionStatsSnapshot {
 
     fn add_record(&mut self, record: &RoutingRecord<'_>, session_id: &str) {
         if record.session_id.as_deref() != Some(session_id) {
+            return;
+        }
+        // Failed calls are bandit outcomes, not served usage: they carry no tokens, so
+        // leave them out of the per-session accounting. Legacy records have no success
+        // field and were all served calls, so they still count.
+        if record.success == Some(false) {
             return;
         }
         let model = match record.model.as_ref() {
@@ -262,5 +390,75 @@ mod tests {
         assert_eq!(stats.models["m1"].calls, 1);
         assert_eq!(stats.models["unknown"].prompt_tokens, 5);
         assert!(snapshot(&path, "missing").expect("read log").is_none());
+    }
+
+    #[test]
+    fn reward_blends_cost_latency_and_success() {
+        // A cheap, fast, successful call scores near the top.
+        let best = compute_reward(Some(0.0), 0.0, true);
+        assert!((best - 1.0).abs() < f64::EPSILON);
+        // A failure scores zero regardless of how cheap or fast it was.
+        assert_eq!(compute_reward(Some(0.0), 0.0, false), 0.0);
+        assert_eq!(compute_reward(Some(0.05), 5_000.0, false), 0.0);
+        // Cost and latency are each capped at their scale and pull the blend down.
+        let pricey_slow = compute_reward(Some(0.1), 20_000.0, true);
+        assert!((pricey_slow - 0.4).abs() < 1e-9);
+        // An unknown cost (no pricing configured) reads as free, not as expensive.
+        let free = compute_reward(None, 0.0, true);
+        assert!((free - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn token_buckets_split_at_their_boundaries() {
+        assert_eq!(token_bucket(0), "small");
+        assert_eq!(token_bucket(999), "small");
+        assert_eq!(token_bucket(1_000), "medium");
+        assert_eq!(token_bucket(10_000), "medium");
+        assert_eq!(token_bucket(10_001), "large");
+    }
+
+    #[test]
+    fn records_round_trip_reward_fields_and_legacy_records_default() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("routing.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                // A full answer-call record with the reward fields.
+                r#"{"model":"nano","prompt_tokens":5,"completion_tokens":2,"cost_usd":0.001,"latency_ms":800.0,"success":true,"reward":0.77,"token_bucket":"small"}"#,
+                "\n",
+                // A failed answer call.
+                r#"{"model":"opus","success":false,"reward":0.0,"token_bucket":"large"}"#,
+                "\n",
+                // A classifier call: not an arm, no reward.
+                r#"{"model":"judge","tier":"classifier","prompt_tokens":3,"completion_tokens":1}"#,
+                "\n",
+                // A legacy record predating the reward fields.
+                r#"{"session_id":"a","model":"m1","prompt_tokens":10,"completion_tokens":2}"#,
+                "\n",
+            ),
+        )
+        .expect("write log");
+
+        let arms = reward_summary(&path).expect("read rewards");
+        // nano: one small-bucket answer with reward 0.77. The legacy record has no reward,
+        // the classifier call carries no reward, so neither becomes an arm.
+        assert_eq!(
+            arms.get(&("nano".to_string(), "small".to_string())),
+            Some(&RewardSummary {
+                count: 1,
+                sum_reward: 0.77,
+            })
+        );
+        assert_eq!(
+            arms.get(&("opus".to_string(), "large".to_string())),
+            Some(&RewardSummary {
+                count: 1,
+                sum_reward: 0.0,
+            })
+        );
+        assert!(!arms.contains_key(&("judge".to_string(), "small".to_string())));
+        assert!(!arms.contains_key(&("m1".to_string(), "small".to_string())));
+        assert_eq!(arms.len(), 2);
     }
 }
