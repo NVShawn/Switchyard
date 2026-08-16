@@ -5,6 +5,7 @@
 """Switchyard command-line entry point."""
 
 import argparse
+from pathlib import Path
 
 from switchyard import __version__
 from switchyard.cli.launch_command import (
@@ -12,6 +13,7 @@ from switchyard.cli.launch_command import (
     cmd_launch_codex,
     cmd_launch_openclaw,
 )
+from switchyard.dream import cmd_dream
 
 
 def _add_launch_parser(
@@ -49,6 +51,43 @@ def _add_launch_parser(
     launch.set_defaults(func=_launch_help)
 
 
+def _add_dream_parser(
+    subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
+) -> None:
+    dream = subparsers.add_parser(
+        "dream",
+        help="Offline dream-step: re-judge a routing log and score calibration",
+    )
+    dream.add_argument(
+        "--log",
+        required=True,
+        type=Path,
+        metavar="PATH",
+        help="Routing log JSONL written by the server.",
+    )
+    dream.add_argument(
+        "--out",
+        type=Path,
+        default=Path("dream_labels.jsonl"),
+        metavar="PATH",
+        help="Where to write fine-tune labels (default: dream_labels.jsonl).",
+    )
+    dream.add_argument(
+        "--strong-model",
+        help="Re-judge each logged task with this OpenAI-compatible model.",
+    )
+    dream.add_argument(
+        "--base-url",
+        default="https://api.openai.com/v1",
+        help="OpenAI-compatible base URL for the strong model.",
+    )
+    dream.add_argument(
+        "--api-key",
+        help="API key for the strong model (default: $OPENAI_API_KEY).",
+    )
+    dream.set_defaults(func=cmd_dream)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="switchyard",
@@ -62,6 +101,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     _add_launch_parser(subparsers)
+    _add_dream_parser(subparsers)
     return parser
 
 

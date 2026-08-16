@@ -163,6 +163,7 @@ switchyard/
 │   ├── launch_command.py           # `switchyard launch`
 │   ├── defaults/                   # packaged OpenRouter TOML deployment
 │   └── launchers/                  # Claude, Codex, and OpenClaw launchers
+├── dream.py                        # `switchyard dream` offline label/calibration tool
 └── libsy/                          # typed Python wrappers for libsy algorithms
 
 switchyard_rust/                    # Python facades over the PyO3 extension
