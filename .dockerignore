@@ -8,3 +8,5 @@ benchmark/datasets
 benchmark/tb_runs
 dist
 site
+target
+deploy/data

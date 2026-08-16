@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Standalone Switchyard serving deployment with prediction and dream support.
+# Serves the repo's routes.toml on host port 4000 and appends durable routing
+# records to a host-writable data dir, so `switchyard dream` can run outside
+# the container against the same file. The running server re-reads the log
+# every five minutes, so backpacked dream data needs no container restart.
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#   uv run switchyard dream --log deploy/data/routing.jsonl
+
+name: switchyard
+
+services:
+  switchyard:
+    build:
+      context: ..
+      dockerfile: benchmark/switchyard-rust-server.Dockerfile
+    image: switchyard-server:local
+    container_name: switchyard
+    restart: unless-stopped
+    environment:
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:?export NVIDIA_API_KEY}
+    ports:
+      - "4000:4000"
+    volumes:
+      - ../routes.toml:/etc/switchyard/routes.toml:ro
+      - ${SWITCHYARD_DATA_DIR:-./data}:/data
+    command:
+      - --config
+      - /etc/switchyard/routes.toml
+      - --host
+      - 0.0.0.0
+      - --routing-log-file
+      - /data/routing.jsonl
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/4000"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s

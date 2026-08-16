@@ -1,0 +1,147 @@
+schema_version = 1
+
+[llm_clients.nvidia]
+format = "openai_chat"
+base_url = "https://inference-api.nvidia.com/v1"
+api_key_env = "NVIDIA_API_KEY"
+
+
+[targets.gpt_strong]
+id = "azure/openai/gpt-5.2"
+llm_client = "nvidia"
+cost = { input_per_1m = 1.25, output_per_1m = 10.0 }
+
+[targets.claude_opus]
+id = "aws/anthropic/bedrock-claude-opus-4-8"
+llm_client = "nvidia"
+capabilities = { supports_json_schema_response_format = false }
+cost = { input_per_1m = 15.0, output_per_1m = 75.0 }
+
+[targets.claude_sonnet]
+id = "nvidia/nvidia/Nemotron-3-Nano-30B-A3B"
+llm_client = "nvidia"
+cost = { input_per_1m = 0.2, output_per_1m = 0.8 }
+
+[targets.gpt_nano]
+id = "azure/openai/gpt-5.4-nano"
+llm_client = "nvidia"
+cost = { input_per_1m = 0.1, output_per_1m = 0.4 }
+
+[targets.nemotron_nano]
+id = "nvidia/nvidia/nemotron-nano-31b-v3"
+llm_client = "nvidia"
+cost = { input_per_1m = 0.15, output_per_1m = 0.6 }
+
+[targets.nemotron_ultra]
+id = "nvidia/nvidia/nemotron-3-ultra"
+llm_client = "nvidia"
+cost = { input_per_1m = 2.0, output_per_1m = 8.0 }
+
+[targets.gpt_sol]
+id = "azure/openai/gpt-5.6-sol"
+llm_client = "nvidia"
+cost = { input_per_1m = 5.0, output_per_1m = 25.0 }
+
+[targets.kimi_max]
+id = "nvidia/moonshotai/kimi-k3-max-preview"
+llm_client = "nvidia"
+cost = { input_per_1m = 3.5, output_per_1m = 14.0 }
+
+[targets.deepseek_pro]
+id = "nvidia/deepseek-ai/deepseek-v4-pro"
+llm_client = "nvidia"
+cost = { input_per_1m = 2.0, output_per_1m = 8.0 }
+
+[targets.glm_strong]
+id = "nvidia/zai-org/glm-5.2"
+llm_client = "nvidia"
+cost = { input_per_1m = 0.5, output_per_1m = 2.0 }
+
+
+[routes.gpt_only]
+id = "gpt_only"
+type = "passthrough"
+target = "gpt_strong"
+
+[routes.claude_only]
+id = "claude_only"
+type = "passthrough"
+target = "claude_opus"
+
+[routes."gpt-5.4-nano"]
+id = "gpt-5.4-nano"
+type = "passthrough"
+target = "gpt_nano"
+
+[routes.gpt_sol]
+id = "gpt_sol"
+type = "passthrough"
+target = "gpt_sol"
+
+[routes.kimi_max]
+id = "kimi_max"
+type = "passthrough"
+target = "kimi_max"
+
+[routes.deepseek_pro]
+id = "deepseek_pro"
+type = "passthrough"
+target = "deepseek_pro"
+
+[routes.glm_strong]
+id = "glm_strong"
+type = "passthrough"
+target = "glm_strong"
+
+[routes.auto_cheap_vs_expensive]
+id = "auto_cheap_vs_expensive"
+type = "llm_classifier"
+mode = "custom"
+classifier_target = "claude_opus"
+targets = ["gpt_strong", "claude_opus", "nemotron_nano", "nemotron_ultra"]
+default_target = "claude_opus"
+session_affinity = true
+prompt = """
+Select the backend best suited to the request.
+
+- gpt_strong: harder reasoning, above cheap but below opus; use for debugging, planning,
+  structured code work, and tasks that require careful reasoning but are not high-risk.
+
+- claude_opus: high-risk, ambiguous, or nuanced work; use for the most ambiguous,
+  high-stakes, cross-module, or uncertain tasks where mistakes are costly.
+
+- nemotron_nano: cheap tier, moderate context window (262K tokens); use for routine
+  chat, light assistance where cost is a primary concern.
+
+- nemotron_ultra: middle tier, large context window (1M tokens); use for more complex
+  reasoning tasks that need more context than nano but not the full capability of opus.
+
+Respond with only a JSON object of the exact form {"decision": {"target": "<name>"}},
+where <name> is one of: gpt_strong, claude_opus, nemotron_nano, nemotron_ultra.
+Add no other keys and no text outside the JSON object.
+"""
+
+response_schema = '''
+{
+  "type": "object",
+  "properties": {
+    "decision": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "enum": ["gpt_strong", "claude_opus", "nemotron_nano", "nemotron_ultra"]
+        }
+      },
+      "required": ["target"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["decision"],
+  "additionalProperties": false
+}
+'''
+[routes.auto_cheap_vs_expensive.policy]
+type = "target_selector"
+selector = "/decision/target"
+

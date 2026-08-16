@@ -113,6 +113,9 @@ config/nemo_llm_proxy_server_config.yaml
 *.log
 logs/
 
+# Local deployment data (routing log written by the deploy/ container)
+deploy/data/
+
 # RL training data
 rl_data/
 
