@@ -137,15 +137,42 @@ fn window_start(tail: &[&Message], recent_turn_window: usize) -> usize {
 }
 
 /// Keeps the opening task and the latest user follow-up when they differ.
+///
+/// This path carries only task text, so tool blocks are stripped: keeping just
+/// two user turns cannot preserve tool pairs, and an orphaned call or result
+/// leads upstreams such as Bedrock to reject the judge request. A message left
+/// with no content after stripping is dropped.
 fn task_messages(messages: &[Message]) -> Vec<Message> {
+    let strip_tools = |message: &Message| -> Option<Message> {
+        let content: Vec<ContentBlock> = message
+            .content
+            .iter()
+            .filter(|block| {
+                !matches!(
+                    block,
+                    ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_)
+                )
+            })
+            .cloned()
+            .collect();
+        if content.is_empty() {
+            return None;
+        }
+        Some(Message {
+            role: message.role,
+            content,
+        })
+    };
     let mut user_messages = messages.iter().filter(|message| message.role == Role::User);
     let Some(opening_task) = user_messages.next() else {
         return Vec::new();
     };
-    match user_messages.next_back() {
-        Some(latest_follow_up) => vec![opening_task.clone(), latest_follow_up.clone()],
-        None => vec![opening_task.clone()],
-    }
+    let latest_follow_up = user_messages.next_back();
+    [Some(opening_task), latest_follow_up]
+        .into_iter()
+        .flatten()
+        .filter_map(strip_tools)
+        .collect()
 }
 
 /// Selects the task messages shown to capability and custom-schema classifiers.
@@ -1580,6 +1607,64 @@ mod tests {
                 Message::text(Role::User, "recent 2"),
             ]
         );
+    }
+
+    /// The no-window path keeps only task text: tool blocks are stripped so the
+    /// judge never receives an orphaned call or result, which Bedrock rejects.
+    #[test]
+    fn task_messages_strip_tool_blocks() {
+        let messages = vec![
+            Message::text(Role::User, "initial task"),
+            tool_call("call-1"),
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult(ToolResult {
+                        tool_call_id: "call-1".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: "tool output".to_string(),
+                        }],
+                        is_error: None,
+                    }),
+                    ContentBlock::Text {
+                        text: "latest follow-up".to_string(),
+                    },
+                ],
+            },
+        ];
+
+        let kept = task_messages(&messages);
+
+        assert_eq!(
+            kept,
+            vec![
+                Message::text(Role::User, "initial task"),
+                Message::text(Role::User, "latest follow-up"),
+            ]
+        );
+    }
+
+    /// A follow-up carrying only a tool result has no task text and is dropped,
+    /// leaving the opening task alone rather than an orphaned result.
+    #[test]
+    fn task_messages_drop_a_follow_up_left_empty() {
+        let messages = vec![
+            Message::text(Role::User, "initial task"),
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult(ToolResult {
+                    tool_call_id: "call-1".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "tool output".to_string(),
+                    }],
+                    is_error: None,
+                })],
+            },
+        ];
+
+        let kept = task_messages(&messages);
+
+        assert_eq!(kept, vec![Message::text(Role::User, "initial task")]);
     }
 
     #[test]

@@ -295,7 +295,7 @@ mod tests {
                     "decision": {
                         "type": "object",
                         "properties": {
-                            "target": {"type": "string", "enum": ["sonnet", "opus"]}
+                            "target": {"type": "string", "enum": ["sonnet", "opus", "nvidia/nvidia/Nemotron-3-Nano-30B-A3B"]}
                         },
                         "required": ["target"],
                         "additionalProperties": false

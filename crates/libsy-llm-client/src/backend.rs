@@ -11,6 +11,7 @@ use serde_json::Value;
 use switchyard_protocol::{Metadata, WireFormat};
 
 use crate::error::{LlmClientError, Result, is_overflow_body};
+use switchyard_translation::TargetCapabilities;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -54,6 +55,9 @@ pub struct HttpBackendConfig {
     pub extra_body: BTreeMap<String, Value>,
     /// Additional attempts after the initial upstream request.
     pub max_retries: u32,
+    /// Capability limits applied when encoding requests for this backend, so an
+    /// upstream that rejects a field (e.g. structured-output) never receives it.
+    pub capabilities: TargetCapabilities,
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -65,6 +69,7 @@ impl fmt::Debug for HttpBackendConfig {
             .field("extra_header_names", &self.extra_headers.keys())
             .field("extra_body_keys", &self.extra_body.keys())
             .field("max_retries", &self.max_retries)
+            .field("capabilities", &self.capabilities)
             .finish()
     }
 }
@@ -248,6 +253,11 @@ impl Backend {
         &self.config().extra_body
     }
 
+    /// Capability limits applied when encoding requests for this backend.
+    pub fn capabilities(&self) -> &TargetCapabilities {
+        &self.config().capabilities
+    }
+
     /// Additional attempts allowed after the initial request.
     pub fn max_retries(&self) -> u32 {
         self.config().max_retries
@@ -344,6 +354,7 @@ mod tests {
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             max_retries: 0,
+            capabilities: Default::default(),
         }
     }
 

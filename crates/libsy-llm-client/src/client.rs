@@ -16,8 +16,8 @@ use switchyard_protocol::{
     LlmRequest, LlmResponse, Metadata, ModelId, Request, Response, RoutedLlmClient,
 };
 use switchyard_translation::{
-    WireFormat, decode_aggregated_response, decode_request, decode_stream,
-    encode_aggregated_response, encode_request, encode_stream,
+    TranslationPolicy, WireFormat, decode_aggregated_response, decode_request, decode_stream,
+    encode_aggregated_response, encode_request_with_policy, encode_stream,
 };
 use tracing::Instrument;
 
@@ -204,7 +204,11 @@ impl TranslatingLlmClient {
         model: &ModelId,
         endpoint: UpstreamEndpoint,
     ) -> Result<EncodedResponse> {
-        let mut body = encode_request(&llm_request, wire_format)
+        let policy = TranslationPolicy {
+            target_capabilities: backend.capabilities().clone(),
+            ..TranslationPolicy::default()
+        };
+        let mut body = encode_request_with_policy(&llm_request, wire_format, &policy)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
         // which keeps the caller's original `model`; force the resolved model so
@@ -833,6 +837,7 @@ mod tests {
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             max_retries: 0,
+            capabilities: Default::default(),
         }
     }
 

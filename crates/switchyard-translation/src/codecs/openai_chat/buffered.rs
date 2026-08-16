@@ -231,7 +231,12 @@ impl FormatCodec for OpenAiChatCodec {
                 Value::String(effort.clone()),
             );
         }
-        if let Some(format) = &request.output.response_format {
+        if let Some(format) = &request.output.response_format
+            && policy
+                .target_capabilities
+                .supports_json_schema_response_format
+                != Some(false)
+        {
             body.insert("response_format".to_string(), format.clone());
         }
         copy_openai_chat_request_extensions(&mut body, &request.extensions.fields);

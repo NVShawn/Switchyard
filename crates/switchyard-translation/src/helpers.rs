@@ -41,6 +41,19 @@ pub fn encode_request(request: &LlmRequest, wire_format: WireFormat) -> Result<V
         .body)
 }
 
+/// Encodes a normalized request into `wire_format`'s JSON body under `policy`,
+/// so a caller can honor per-target capabilities such as structured-output
+/// support.
+pub fn encode_request_with_policy(
+    request: &LlmRequest,
+    wire_format: WireFormat,
+    policy: &TranslationPolicy,
+) -> Result<Value> {
+    Ok(DEFAULT_TRANSLATION_ENGINE
+        .encode_request(wire_format, request, policy)?
+        .body)
+}
+
 /// Decodes a buffered `wire_format` response body into the neutral aggregate.
 pub fn decode_aggregated_response(body: &Value, wire_format: WireFormat) -> Result<AggLlmResponse> {
     Ok(DEFAULT_TRANSLATION_ENGINE

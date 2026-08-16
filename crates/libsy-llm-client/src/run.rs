@@ -575,6 +575,7 @@ mod tests {
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
                 max_retries: 2,
+                capabilities: Default::default(),
             })
         };
         let client = Arc::new(

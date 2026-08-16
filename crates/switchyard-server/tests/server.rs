@@ -133,6 +133,22 @@ async fn upstream_chat(
             .into_response();
     }
     if body["stream"].as_bool() == Some(true) {
+        if body["messages"][0]["content"] == "prose-check" {
+            let events = [
+                json!({"id": "chatcmpl-prose", "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}}]}).to_string(),
+                json!({"id": "chatcmpl-prose", "model": model, "choices": [{"index": 0, "delta": {"content": "Prose before the action. "}}]}).to_string(),
+                json!({"id": "chatcmpl-prose", "model": model, "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "run_shell", "arguments": "{\"cmd\":\"ls\"}"}}]}}]}).to_string(),
+                json!({"id": "chatcmpl-prose", "model": model, "choices": [{"index": 0, "delta": {"content": "Prose after the action."}}]}).to_string(),
+                json!({"id": "chatcmpl-prose", "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}).to_string(),
+                "[DONE]".to_string(),
+            ];
+            let stream = futures_util::stream::iter(
+                events
+                    .into_iter()
+                    .map(|data| Ok::<Event, Infallible>(Event::default().data(data))),
+            );
+            return Sse::new(stream).into_response();
+        }
         if body["messages"][0]["content"] == "stream-error" {
             let events = [
                 json!({"id": "chatcmpl-stream-error", "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}}]}).to_string(),
@@ -341,6 +357,7 @@ fn random_state(base_url: &str, routes: &[(&str, &[&str])]) -> TestResult<Server
         extra_headers: BTreeMap::new(),
         extra_body: BTreeMap::new(),
         max_retries: 0,
+        capabilities: Default::default(),
     });
     let target_models = routes
         .iter()
@@ -1156,6 +1173,190 @@ selector = "/decision/target"
         judge_call["response_format"]["json_schema"]["schema"]["properties"]["decision"]["properties"]
             ["target"]["enum"],
         json!(["weak", "middle", "strong", "premium"])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[tokio::test]
+async fn custom_classifier_streams_prose_and_tool_calls_from_the_routed_model() -> TestResult {
+    // A custom-schema classifier must relay the routed model's response untouched:
+    // both the prose that accompanies a tool call and the tool call itself. This
+    // mirrors a coding agent whose assistant messages mix text with tool calls.
+    let upstream = MockUpstream::start().await?;
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.upstream]
+format = "openai_chat"
+base_url = "{base_url}"
+
+[targets.classifier]
+id = "model/classifier"
+llm_client = "upstream"
+
+[targets.weak]
+id = "model/weak"
+llm_client = "upstream"
+
+[targets.strong]
+id = "model/strong"
+llm_client = "upstream"
+
+[targets.premium]
+id = "model/premium"
+llm_client = "upstream"
+
+[routes.custom]
+id = "switchyard/custom"
+type = "llm_classifier"
+mode = "custom"
+classifier_target = "classifier"
+targets = ["weak", "strong", "premium"]
+default_target = "strong"
+prompt = "CUSTOM MULTI TARGET"
+response_schema = '''
+{{
+  "type": "object",
+  "properties": {{
+    "decision": {{
+      "type": "object",
+      "properties": {{
+        "target": {{"type": "string", "enum": ["weak", "strong", "premium"]}}
+      }},
+      "required": ["target"],
+      "additionalProperties": false
+    }}
+  }},
+  "required": ["decision"],
+  "additionalProperties": false
+}}
+'''
+
+[routes.custom.policy]
+type = "target_selector"
+selector = "/decision/target"
+"#,
+        base_url = upstream.base_url
+    ))?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": "switchyard/custom",
+            "stream": true,
+            "messages": [{"role": "user", "content": "prose-check"}]
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let body = response.text()?.to_string();
+    assert!(
+        body.contains("Prose before the action."),
+        "prose before the tool call was dropped:\n{body}"
+    );
+    assert!(
+        body.contains("Prose after the action."),
+        "prose after the tool call was dropped:\n{body}"
+    );
+    assert!(
+        body.contains("run_shell"),
+        "the tool call was dropped:\n{body}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn custom_classifier_responses_api_streams_prose_from_the_routed_model() -> TestResult {
+    // The Responses API leg (opencode's `@ai-sdk/openai` provider) must relay the
+    // routed model's prose text deltas just like the chat-completions leg does.
+    let upstream = MockUpstream::start().await?;
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.upstream]
+format = "openai_chat"
+base_url = "{base_url}"
+
+[targets.classifier]
+id = "model/classifier"
+llm_client = "upstream"
+
+[targets.weak]
+id = "model/weak"
+llm_client = "upstream"
+
+[targets.strong]
+id = "model/strong"
+llm_client = "upstream"
+
+[targets.premium]
+id = "model/premium"
+llm_client = "upstream"
+
+[routes.custom]
+id = "switchyard/custom"
+type = "llm_classifier"
+mode = "custom"
+classifier_target = "classifier"
+targets = ["weak", "strong", "premium"]
+default_target = "strong"
+prompt = "CUSTOM MULTI TARGET"
+response_schema = '''
+{{
+  "type": "object",
+  "properties": {{
+    "decision": {{
+      "type": "object",
+      "properties": {{
+        "target": {{"type": "string", "enum": ["weak", "strong", "premium"]}}
+      }},
+      "required": ["target"],
+      "additionalProperties": false
+    }}
+  }},
+  "required": ["decision"],
+  "additionalProperties": false
+}}
+'''
+
+[routes.custom.policy]
+type = "target_selector"
+selector = "/decision/target"
+"#,
+        base_url = upstream.base_url
+    ))?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/responses",
+        Some(json!({
+            "model": "switchyard/custom",
+            "stream": true,
+            "input": "prose-check"
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let body = response.text()?.to_string();
+    assert!(
+        body.contains("Prose before the action."),
+        "Responses prose delta before the tool call was dropped:\n{body}"
+    );
+    assert!(
+        body.contains("Prose after the action."),
+        "Responses prose delta after the tool call was dropped:\n{body}"
+    );
+    assert!(
+        body.contains("run_shell"),
+        "Responses tool call was dropped:\n{body}"
     );
     Ok(())
 }

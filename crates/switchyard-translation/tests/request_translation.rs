@@ -6,7 +6,8 @@
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use switchyard_translation::{
-    LossyConversionPolicy, TranslationEngine, TranslationPolicy, WireFormat,
+    LlmRequest, LossyConversionPolicy, Message, OutputParams, Role, TargetCapabilities,
+    TranslationEngine, TranslationPolicy, WireFormat, encode_request_with_policy,
 };
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -1362,6 +1363,36 @@ fn openai_schema_constraints_are_removed_from_anthropic_output_format() -> TestR
         body["response_format"]["json_schema"]["schema"]["properties"]["p_solve"]["minimum"],
         0
     );
+    Ok(())
+}
+
+// A target that cannot accept structured output drops `response_format` when
+// encoding, so an upstream such as Bedrock never receives a field it rejects.
+#[test]
+fn response_format_is_dropped_when_the_target_rejects_structured_output() -> TestResult {
+    let request = LlmRequest {
+        model: Some("claude-opus-4-8".to_string()),
+        messages: vec![Message::text(Role::User, "Return a probability.")],
+        output: OutputParams {
+            response_format: Some(json!({
+                "type": "json_schema",
+                "json_schema": {"name": "probability", "schema": {"type": "object"}}
+            })),
+            ..OutputParams::default()
+        },
+        ..LlmRequest::default()
+    };
+    let policy = TranslationPolicy {
+        target_capabilities: TargetCapabilities {
+            supports_json_schema_response_format: Some(false),
+            ..TargetCapabilities::default()
+        },
+        ..TranslationPolicy::default()
+    };
+
+    let body = encode_request_with_policy(&request, WireFormat::OpenAiChat, &policy)?;
+
+    assert!(body.get("response_format").is_none());
     Ok(())
 }
 

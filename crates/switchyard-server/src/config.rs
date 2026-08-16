@@ -21,6 +21,7 @@ use switchyard_llm_client::{
     TranslatingLlmClient,
 };
 use switchyard_protocol::{ModelId, RoutedLlmClient};
+use switchyard_translation::TargetCapabilities;
 
 use crate::{
     CallerAuthKind, CountTokensTarget, ModelCapabilities, ServerError, ServerResult, ServerState,
@@ -137,7 +138,12 @@ impl ServerConfig {
                 .ok_or_else(|| ServerError::new("validated llm client was not initialized"))?;
             model_configs.push(ModelConfig::new(
                 target.id.clone(),
-                build_backend(&target.llm_client, client_config, &target.extra_body)?,
+                build_backend(
+                    &target.llm_client,
+                    client_config,
+                    &target.extra_body,
+                    &target.capabilities,
+                )?,
                 None,
             ));
         }
@@ -265,6 +271,8 @@ struct TargetConfig {
     llm_client: String,
     #[serde(default)]
     extra_body: BTreeMap<String, Value>,
+    #[serde(default)]
+    capabilities: TargetCapabilities,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -798,6 +806,7 @@ fn build_backend(
     client_name: &str,
     config: &LlmClientConfig,
     extra_body: &BTreeMap<String, Value>,
+    capabilities: &TargetCapabilities,
 ) -> ServerResult<Backend> {
     let base_url = config.base_url.trim();
     if base_url.is_empty() {
@@ -844,6 +853,7 @@ fn build_backend(
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
         max_retries: config.max_retries,
+        capabilities: capabilities.clone(),
     };
     Ok(match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),
@@ -1487,7 +1497,7 @@ target = "azure"
         let Some(client) = config.llm_clients.get("primary") else {
             return Err(ServerError::new("primary llm client is missing"));
         };
-        let backend = build_backend("primary", client, &target.extra_body)?;
+        let backend = build_backend("primary", client, &target.extra_body, &target.capabilities)?;
 
         assert_eq!(
             backend.extra_body().get("service_tier"),
