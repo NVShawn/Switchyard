@@ -33,7 +33,8 @@
           "type": "string",
           "enum": ["supported", "uncertain", "unsupported", "unmatched"]
         },
-        "p_solve": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+        "p_solve": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "minimum_capability": {"type": "number", "minimum": 0.0, "maximum": 1.0}
       }
     }
   }

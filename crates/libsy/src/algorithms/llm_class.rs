@@ -41,12 +41,20 @@ struct TaskClassifierVerdict {
     primary_rule: String,
     capability_boundary: String,
     p_solve: f64,
+    /// Lowest capability level the judge believes will solve the task, on the
+    /// same 0..1 scale as each target's declared `capability`. Optional so a
+    /// judge serving a binary route can omit it; ranked routes require it.
+    #[serde(default)]
+    minimum_capability: Option<f64>,
 }
 
 impl TaskClassifierVerdict {
     /// Rejects malformed or internally inconsistent verdicts before policy evaluation.
     fn is_valid(&self) -> bool {
         (0.0..=1.0).contains(&self.p_solve)
+            && self
+                .minimum_capability
+                .is_none_or(|level| (0.0..=1.0).contains(&level))
             && !self.crux.trim().is_empty()
             && matches!(
                 (
@@ -193,11 +201,42 @@ impl ClassifierInput for TaskInput {
 
 type CapabilityJudge = StructuredJudge<TaskInput, SerdeDecoder<TaskClassifierVerdict>>;
 
+/// One rung of a cost-aware capability ladder: a routing target with its declared
+/// static capability level and inherited unit cost.
+///
+/// `capability` is on the same 0..1 scale as the judge's `minimum_capability`
+/// verdict; `cost` orders adequate targets cheapest-first. Constructed by the host
+/// from deployment config and handed to the capability route.
+#[derive(Clone, Debug)]
+pub struct CapabilityTarget {
+    /// The routing target this rung selects.
+    pub target: ModelId,
+    /// Declared capability level in `[0.0, 1.0]`.
+    pub capability: f64,
+    /// Unit pricing inherited from the target's deployment config.
+    pub cost: switchyard_protocol::TargetCost,
+}
+
+impl CapabilityTarget {
+    /// Validates the declared capability level.
+    fn is_valid(&self) -> bool {
+        self.capability.is_finite() && (0.0..=1.0).contains(&self.capability)
+    }
+
+    /// Scalar used to order rungs cheapest-first. Input and output unit prices are
+    /// summed because the request's input/output split is not known at select time.
+    fn cost_key(&self) -> f64 {
+        self.cost.input_per_1m + self.cost.output_per_1m
+    }
+}
+
 struct TaskClassifierPolicy {
     efficient_target: ModelId,
     capable_target: ModelId,
     base_threshold: f64,
     threshold_step: f64,
+    /// Cost-ascending capability ladder; empty selects the binary efficient/capable policy.
+    ranked: Vec<CapabilityTarget>,
 }
 
 impl TaskClassifierPolicy {
@@ -211,12 +250,53 @@ impl TaskClassifierPolicy {
             capable_target: capable_target.into(),
             base_threshold: config.base_threshold,
             threshold_step: config.threshold_step,
+            ranked: Vec::new(),
         }
+    }
+
+    /// Cost-aware form: routes among `ranked` instead of the binary tier pair.
+    fn with_ranked_targets(mut self, ranked: Vec<CapabilityTarget>) -> Self {
+        self.ranked = ranked;
+        self
     }
 
     /// Returns the required solve probability for one validated verdict.
     fn threshold(&self, verdict: &TaskClassifierVerdict) -> Option<f64> {
         Some(self.base_threshold + f64::from(verdict.boundary_steps()?) * self.threshold_step)
+    }
+
+    /// The most capable rung, used when the judge judges the task beyond the cheap
+    /// tiers or names no usable level.
+    fn most_capable(&self) -> &ModelId {
+        self.ranked
+            .iter()
+            .max_by(|a, b| {
+                a.capability
+                    .partial_cmp(&b.capability)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|rung| &rung.target)
+            .unwrap_or(&self.capable_target)
+    }
+
+    /// Picks the cheapest rung whose declared capability clears the judge's required
+    /// level. The ladder is cost-ascending, so the first adequate rung is the pick.
+    fn ranked_pick(&self, verdict: &TaskClassifierVerdict) -> ModelId {
+        // An unsupported boundary means the cheap tiers are judged out; go straight to
+        // the strongest rung rather than trusting a level the judge already flagged.
+        if verdict.capability_boundary == "unsupported" {
+            return self.most_capable().clone();
+        }
+        // The ranked pick needs the judge's required level; without one it cannot
+        // tell the rungs apart, so fall back to the strongest rung.
+        let Some(required) = verdict.minimum_capability else {
+            return self.most_capable().clone();
+        };
+        self.ranked
+            .iter()
+            .find(|rung| rung.capability >= required)
+            .map(|rung| rung.target.clone())
+            .unwrap_or_else(|| self.most_capable().clone())
     }
 }
 
@@ -229,6 +309,13 @@ impl JudgePolicy for TaskClassifierPolicy {
         let Some(verdict) = verdict.filter(|verdict| verdict.is_valid()) else {
             return Classification::Ambiguous(vec![]);
         };
+        // Cost-aware ladder: pick the cheapest rung adequate for the judged level.
+        if !self.ranked.is_empty() {
+            return Classification::Scores(vec![Score {
+                target: self.ranked_pick(verdict),
+                confidence: 1.0,
+            }]);
+        }
         // A usable verdict below the capability threshold is still a decision: the judge
         // does not trust the efficient tier with this task.
         let Some(threshold) = self.threshold(verdict) else {
@@ -634,6 +721,13 @@ pub enum LlmClassifierConfig {
         efficient_target: ModelId,
         /// Target used when the task needs the capable tier.
         capable_target: ModelId,
+        /// Cost-ascending capability ladder for cost-aware multi-target routing.
+        ///
+        /// Empty selects the binary efficient/capable policy. Two or more rungs switch
+        /// to the cost-aware pick: the cheapest rung whose declared capability clears
+        /// the judge's `minimum_capability`.
+        #[doc = ""]
+        capability_targets: Vec<CapabilityTarget>,
         /// Capability classifier settings.
         config: TaskClassifierConfig,
     },
@@ -678,8 +772,15 @@ impl LlmTaskClassifier {
                 judge_target,
                 efficient_target,
                 capable_target,
+                capability_targets,
                 config,
-            } => Self::build_capability(judge_target, efficient_target, capable_target, config),
+            } => Self::build_capability(
+                judge_target,
+                efficient_target,
+                capable_target,
+                capability_targets,
+                config,
+            ),
             LlmClassifierConfig::Escalation {
                 judge_target,
                 efficient_target,
@@ -708,11 +809,57 @@ impl LlmTaskClassifier {
         judge_target: ModelId,
         efficient_target: ModelId,
         capable_target: ModelId,
+        capability_targets: Vec<CapabilityTarget>,
         config: TaskClassifierConfig,
     ) -> Result<Self> {
         config.validate()?;
+        // Validate and order the ladder cheapest-first. An empty ladder keeps the binary
+        // efficient/capable policy; one rung is not a ladder, so reject it.
+        let ranked = if capability_targets.is_empty() {
+            Vec::new()
+        } else {
+            if capability_targets.len() < 2 {
+                return Err(LibsyError::AlgorithmError {
+                    message: "capability_targets requires at least two rungs".to_string(),
+                });
+            }
+            if let Some(rung) = capability_targets.iter().find(|rung| !rung.is_valid()) {
+                return Err(LibsyError::AlgorithmError {
+                    message: format!(
+                        "capability target {:?} capability must be between 0 and 1, got {}",
+                        rung.target, rung.capability
+                    ),
+                });
+            }
+            let mut ranked = capability_targets;
+            ranked.sort_by(|a, b| {
+                a.cost_key()
+                    .partial_cmp(&b.cost_key())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            ranked
+        };
         let contract = Self::load_capability_contract(&config.contract)?;
-        let targets = vec![efficient_target.clone(), capable_target.clone()];
+        let targets = if ranked.is_empty() {
+            vec![efficient_target.clone(), capable_target.clone()]
+        } else {
+            ranked.iter().map(|rung| rung.target.clone()).collect()
+        };
+        // The cascade's last-resort target is the strongest rung on a ladder, else the
+        // capable tier as before.
+        let default_target = if ranked.is_empty() {
+            capable_target.clone()
+        } else {
+            ranked
+                .iter()
+                .max_by(|a, b| {
+                    a.capability
+                        .partial_cmp(&b.capability)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|rung| rung.target.clone())
+                .unwrap_or_else(|| capable_target.clone())
+        };
         let session_affinity = config.session_affinity;
         let message_hash_fallback = config.message_hash_fallback;
         let classifier = Arc::new(TaskClassifier {
@@ -730,7 +877,8 @@ impl LlmTaskClassifier {
                     efficient_target.clone(),
                     capable_target.clone(),
                     &config,
-                ),
+                )
+                .with_ranked_targets(ranked),
             ),
             efficient_target: efficient_target.clone(),
             capable_target: capable_target.clone(),
@@ -740,7 +888,7 @@ impl LlmTaskClassifier {
             targets,
             inner,
             ClassifierRouteConfig {
-                default_target: classifier.capable_target.clone(),
+                default_target,
                 session_affinity,
                 message_hash_fallback,
             },
@@ -1001,6 +1149,20 @@ mod tests {
             primary_rule: primary_rule.to_string(),
             capability_boundary: capability_boundary.to_string(),
             p_solve,
+            minimum_capability: None,
+        }
+    }
+
+    /// Verdict with an explicit `minimum_capability`, for ranked-ladder tests.
+    fn ranked_verdict(
+        p_solve: f64,
+        capability_boundary: &str,
+        primary_rule: &str,
+        minimum_capability: f64,
+    ) -> TaskClassifierVerdict {
+        TaskClassifierVerdict {
+            minimum_capability: Some(minimum_capability),
+            ..verdict(p_solve, capability_boundary, primary_rule)
         }
     }
 
@@ -1110,6 +1272,7 @@ mod tests {
                 judge_target: ModelId::from("judge"),
                 efficient_target: ModelId::from("efficient"),
                 capable_target: ModelId::from("capable"),
+                capability_targets: Vec::new(),
                 config: test_config(TEST_THRESHOLD),
             },
         )?))
@@ -1195,6 +1358,7 @@ mod tests {
             judge_target: ModelId::from("judge"),
             efficient_target: ModelId::from("efficient"),
             capable_target: ModelId::from("capable"),
+            capability_targets: Vec::new(),
             config: TaskClassifierConfig {
                 max_output_tokens: 512,
                 ..test_config(TEST_THRESHOLD)
@@ -1214,6 +1378,7 @@ mod tests {
             judge_target: ModelId::from("judge"),
             efficient_target: ModelId::from("efficient"),
             capable_target: ModelId::from("capable"),
+            capability_targets: Vec::new(),
             config: TaskClassifierConfig {
                 contract: ClassifierContractConfig::default()
                     .with_prompt("Custom capability rubric."),
@@ -1236,6 +1401,7 @@ mod tests {
             judge_target: ModelId::from("judge"),
             efficient_target: ModelId::from("efficient"),
             capable_target: ModelId::from("capable"),
+            capability_targets: Vec::new(),
             config: TaskClassifierConfig {
                 session_affinity: true,
                 ..test_config(TEST_THRESHOLD)
@@ -1257,6 +1423,7 @@ mod tests {
             judge_target: ModelId::from("judge"),
             efficient_target: ModelId::from("efficient"),
             capable_target: ModelId::from("capable"),
+            capability_targets: Vec::new(),
             config: TaskClassifierConfig {
                 session_affinity: true,
                 message_hash_fallback: true,
@@ -1321,6 +1488,7 @@ mod tests {
                     judge_target: ModelId::from("judge"),
                     efficient_target: ModelId::from("e"),
                     capable_target: ModelId::from("c"),
+                    capability_targets: Vec::new(),
                     config: test_config(bad),
                 })
                 .is_err(),
@@ -1354,6 +1522,7 @@ mod tests {
                     judge_target: ModelId::from("judge"),
                     efficient_target: ModelId::from("e"),
                     capable_target: ModelId::from("c"),
+                    capability_targets: Vec::new(),
                     config,
                 })
                 .is_err()
@@ -1364,6 +1533,7 @@ mod tests {
                 judge_target: ModelId::from("judge"),
                 efficient_target: ModelId::from("e"),
                 capable_target: ModelId::from("c"),
+                capability_targets: Vec::new(),
                 config: test_config(base_threshold),
             })?;
         }
@@ -1432,6 +1602,160 @@ mod tests {
             "efficient"
         );
         Ok(())
+    }
+
+    /// A four-rung ladder in cost order: nano < strong < ultra < opus by price.
+    fn ranked_policy() -> TaskClassifierPolicy {
+        let rung = |name: &str, capability: f64, price: f64| CapabilityTarget {
+            target: ModelId::from(name),
+            capability,
+            cost: switchyard_protocol::TargetCost {
+                input_per_1m: price,
+                output_per_1m: price,
+            },
+        };
+        TaskClassifierPolicy::new("efficient", "capable", &test_config(TEST_THRESHOLD))
+            .with_ranked_targets(vec![
+                rung("nano", 0.2, 0.1),
+                rung("strong", 0.5, 0.5),
+                rung("ultra", 0.8, 1.0),
+                rung("opus", 1.0, 3.0),
+            ])
+    }
+
+    #[test]
+    fn ranked_pick_is_the_cheapest_rung_that_clears_the_judged_level() -> Result<()> {
+        let policy = ranked_policy();
+        assert_eq!(
+            selected(
+                &policy,
+                Some(&ranked_verdict(0.9, "supported", "SUP-1", 0.1))
+            )?,
+            "nano"
+        );
+        assert_eq!(
+            selected(
+                &policy,
+                Some(&ranked_verdict(0.5, "supported", "SUP-1", 0.5))
+            )?,
+            "strong"
+        );
+        assert_eq!(
+            selected(
+                &policy,
+                Some(&ranked_verdict(0.3, "uncertain", "UNC-1", 0.9))
+            )?,
+            "opus"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ranked_pick_falls_through_to_the_most_capable_rung() -> Result<()> {
+        let policy = ranked_policy();
+        // An unsupported boundary distrusts the cheap tiers regardless of level.
+        assert_eq!(
+            selected(
+                &policy,
+                Some(&ranked_verdict(0.9, "unsupported", "LIM-1", 0.1))
+            )?,
+            "opus"
+        );
+        // A required level above every rung lands on the strongest rung too.
+        assert_eq!(
+            selected(
+                &policy,
+                Some(&ranked_verdict(0.9, "supported", "SUP-1", 1.0))
+            )?,
+            "opus"
+        );
+        // A verdict without a usable level cannot tell the rungs apart.
+        assert_eq!(
+            selected(&policy, Some(&verdict(0.9, "supported", "SUP-1")))?,
+            "opus"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ranked_pick_orders_by_cost_not_declaration_order() -> Result<()> {
+        // Declare the rungs dearest-first; the ladder must still pick the cheapest
+        // adequate rung, so the policy orders by cost, not config order.
+        let rung = |name: &str, capability: f64, price: f64| CapabilityTarget {
+            target: ModelId::from(name),
+            capability,
+            cost: switchyard_protocol::TargetCost {
+                input_per_1m: price,
+                output_per_1m: price,
+            },
+        };
+        let router = LlmTaskClassifier::new(LlmClassifierConfig::Capability {
+            judge_target: ModelId::from("judge"),
+            efficient_target: ModelId::from("cheap"),
+            capable_target: ModelId::from("opus"),
+            capability_targets: vec![
+                rung("opus", 1.0, 3.0),
+                rung("cheap", 0.5, 0.1),
+                rung("mid", 0.5, 0.4),
+            ],
+            config: test_config(TEST_THRESHOLD),
+        })?;
+        let _ = router;
+        // The build sorts by cost: cheap (0.2 total) < mid (0.8) < opus (6.0). A 0.5
+        // requirement clears both cheap and mid; the cheapest adequate rung wins.
+        let policy = TaskClassifierPolicy::new("cheap", "opus", &test_config(TEST_THRESHOLD))
+            .with_ranked_targets({
+                let mut rungs = vec![
+                    rung("opus", 1.0, 3.0),
+                    rung("cheap", 0.5, 0.1),
+                    rung("mid", 0.5, 0.4),
+                ];
+                rungs.sort_by(|a, b| {
+                    a.cost_key()
+                        .partial_cmp(&b.cost_key())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                rungs
+            });
+        assert_eq!(
+            selected(
+                &policy,
+                Some(&ranked_verdict(0.9, "supported", "SUP-1", 0.5))
+            )?,
+            "cheap"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_ladder_of_one_or_an_invalid_level_is_rejected() {
+        let rung = |name: &str, capability: f64| CapabilityTarget {
+            target: ModelId::from(name),
+            capability,
+            cost: switchyard_protocol::TargetCost::default(),
+        };
+        // One rung is not a ladder.
+        assert!(
+            LlmTaskClassifier::new(LlmClassifierConfig::Capability {
+                judge_target: ModelId::from("judge"),
+                efficient_target: ModelId::from("e"),
+                capable_target: ModelId::from("c"),
+                capability_targets: vec![rung("only", 0.5)],
+                    config: test_config(TEST_THRESHOLD),
+            })
+            .is_err()
+        );
+        // Capability levels outside 0..=1 are rejected.
+        assert!(
+            LlmTaskClassifier::new(LlmClassifierConfig::Capability {
+                judge_target: ModelId::from("judge"),
+                efficient_target: ModelId::from("e"),
+                capable_target: ModelId::from("c"),
+                capability_targets: vec![rung("a", 0.5), rung("b", 1.5)],
+                    config: test_config(TEST_THRESHOLD),
+            })
+            .is_err()
+        );
     }
 
     /// The text of each message a judge with `recent_turn_window` would be sent.

@@ -491,6 +491,7 @@ fn classifier_router(
             judge_target: ModelId::from(judge_model),
             efficient_target: ModelId::from(efficient_model),
             capable_target: ModelId::from(capable_model),
+            capability_targets: Vec::new(),
             config: TaskClassifierConfig {
                 base_threshold: 0.5,
                 ..TaskClassifierConfig::default()

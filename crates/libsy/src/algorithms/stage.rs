@@ -185,6 +185,7 @@ fn build_route(
                 judge_target: fallback.judge_target,
                 efficient_target: efficient,
                 capable_target: capable,
+                capability_targets: Vec::new(),
                 config: fallback.config,
             })?),
             source: DecisionSource::LlmClassifier,

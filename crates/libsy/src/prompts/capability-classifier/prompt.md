@@ -26,6 +26,10 @@ rates. The capability card is qualitative evidence, not a measured prior.
    extreme estimates, but it is not evidence that p_solve must equal 0.50.
 5. Estimate p_solve last. It is the probability of whole-task SUCCESS, not
    confidence in this assessment, a route recommendation, or a cost judgment.
+6. Estimate minimum_capability: the lowest capability level, on a 0.00 to 1.00
+   scale, of a model that would still complete the whole task correctly. 0.00
+   means the weakest available model suffices; 1.00 means only the most capable
+   model will do. Base it on the crux, not on which model you prefer.
 
 Interpret probabilities as natural frequencies. If p_solve is 0.70 for 100
 comparable fresh runs, about 70 should succeed and 30 should fail. Use the full
@@ -56,5 +60,6 @@ Return exactly one JSON object matching the response schema supplied with the
 request. Do not include markdown or commentary.
 
 p_solve must be between 0.00 and 1.00. p_fail is exactly 1.00 - p_solve and
-must not be emitted separately. Do not output recommended_route, confidence,
-abstain, counts, task totals, empirical rates, or any other field.
+must not be emitted separately. minimum_capability must be between 0.00 and
+1.00. Do not output recommended_route, confidence, abstain, counts, task
+totals, empirical rates, or any other field.

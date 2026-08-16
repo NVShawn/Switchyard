@@ -113,7 +113,7 @@ impl ServerConfig {
                     "route {route_name} context_window must be greater than zero"
                 )));
             }
-            let algorithm = build_algorithm(route_name, config, &targets)?;
+            let algorithm = build_algorithm(route_name, config, &targets, &self.targets)?;
             let (client, caller_auth) = self.build_route_clients(route_name, config, &clients)?;
             let count_tokens_target = self.build_count_tokens_target(config, &clients);
             routes.push((
@@ -314,6 +314,15 @@ enum ClassifierPolicyConfig {
     TargetSelector { selector: String },
 }
 
+/// One rung of a capability-mode cost ladder: a target name with its declared
+/// static capability level. The unit cost is inherited from the named target.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityTargetConfig {
+    target: String,
+    capability: f64,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ClassifierMode {
@@ -349,6 +358,8 @@ struct CapabilityClassifierRouteConfig {
     prompt: Option<String>,
     response_format_type: ClassifierResponseFormat,
     max_output_tokens: u64,
+    /// Cost-ascending capability ladder; empty selects the binary strong/weak policy.
+    capability_targets: Vec<CapabilityTargetConfig>,
 }
 
 #[derive(Debug)]
@@ -449,6 +460,9 @@ enum RouteConfig {
         response_schema: Option<String>,
         #[serde(default)]
         policy: Option<ClassifierPolicyConfig>,
+        /// Cost-ascending capability ladder for cost-aware capability routing.
+        #[serde(default)]
+        capability_targets: Option<Vec<CapabilityTargetConfig>>,
     },
     StageRouter {
         id: ModelId,
@@ -542,17 +556,24 @@ impl RouteConfig {
                 weak_target,
                 escalation,
                 targets,
+                capability_targets,
                 ..
             } => match mode.unwrap_or(if escalation.is_some() {
                 ClassifierMode::Escalation
             } else {
                 ClassifierMode::Capability
             }) {
-                ClassifierMode::Capability => weak_target
-                    .iter()
-                    .chain(strong_target)
-                    .map(String::as_str)
-                    .collect(),
+                ClassifierMode::Capability => match capability_targets {
+                    // A capability ladder routes to its rungs; the binary pair otherwise.
+                    Some(rungs) if !rungs.is_empty() => {
+                        rungs.iter().map(|rung| rung.target.as_str()).collect()
+                    }
+                    _ => weak_target
+                        .iter()
+                        .chain(strong_target)
+                        .map(String::as_str)
+                        .collect(),
+                },
                 ClassifierMode::Escalation => strong_target
                     .iter()
                     .chain(weak_target)
@@ -645,6 +666,7 @@ impl RouteConfig {
             default_target,
             response_schema,
             policy,
+            capability_targets,
             ..
         } = self
         else {
@@ -674,18 +696,51 @@ impl RouteConfig {
                     response_schema,
                     policy,
                 )?;
+                let capability_targets = capability_targets.clone().unwrap_or_default();
+                for rung in &capability_targets {
+                    if !rung.capability.is_finite() || !(0.0..=1.0).contains(&rung.capability) {
+                        return Err(ServerError::new(format!(
+                            "llm_classifier route {route_name} capability target {:?} capability must be between 0 and 1, got {}",
+                            rung.target, rung.capability
+                        )));
+                    }
+                }
+                // A capability ladder switches to cost-aware ranked routing; its strong/weak
+                // endpoints default to the most/least capable rungs when not named explicitly.
+                let (strong_target, weak_target) = if capability_targets.is_empty() {
+                    (
+                        required_classifier_field(route_name, "strong_target", strong_target)?,
+                        required_classifier_field(route_name, "weak_target", weak_target)?,
+                    )
+                } else {
+                    let by_capability = |a: &&CapabilityTargetConfig, b: &&CapabilityTargetConfig| {
+                        a.capability.partial_cmp(&b.capability).unwrap_or(std::cmp::Ordering::Equal)
+                    };
+                    let weakest = capability_targets
+                        .iter()
+                        .min_by(by_capability)
+                        .map(|rung| rung.target.clone());
+                    let strongest = capability_targets
+                        .iter()
+                        .max_by(by_capability)
+                        .map(|rung| rung.target.clone());
+                    (
+                        strong_target.clone().or(strongest).ok_or_else(|| {
+                            ServerError::new(format!(
+                                "llm_classifier route {route_name} requires strong_target"
+                            ))
+                        })?,
+                        weak_target.clone().or(weakest).ok_or_else(|| {
+                            ServerError::new(format!(
+                                "llm_classifier route {route_name} requires weak_target"
+                            ))
+                        })?,
+                    )
+                };
                 Ok(LlmClassifierModeConfig::Capability(
                     CapabilityClassifierRouteConfig {
-                        strong_target: required_classifier_field(
-                            route_name,
-                            "strong_target",
-                            strong_target,
-                        )?,
-                        weak_target: required_classifier_field(
-                            route_name,
-                            "weak_target",
-                            weak_target,
-                        )?,
+                        strong_target,
+                        weak_target,
                         base_threshold: required_classifier_field(
                             route_name,
                             "base_threshold",
@@ -698,6 +753,7 @@ impl RouteConfig {
                         prompt: prompt.clone(),
                         response_format_type: *response_format_type,
                         max_output_tokens: *max_output_tokens,
+                        capability_targets,
                     },
                 ))
             }
@@ -710,6 +766,13 @@ impl RouteConfig {
                     response_schema,
                     policy,
                 )?;
+                if capability_targets.is_some() {
+                    return Err(classifier_field_error(
+                        route_name,
+                        "capability_targets",
+                        "escalation",
+                    ));
+                }
                 if mode.is_some()
                     && (base_threshold.is_some()
                         || threshold_step.is_some()
@@ -746,6 +809,7 @@ impl RouteConfig {
                     || base_threshold.is_some()
                     || threshold_step.is_some()
                     || escalation.is_some()
+                    || capability_targets.is_some()
                     || *response_format_type != ClassifierResponseFormat::JsonSchema
                 {
                     return Err(ServerError::new(format!(
@@ -884,6 +948,7 @@ fn build_algorithm(
     route_name: &str,
     config: &RouteConfig,
     targets: &BTreeMap<String, ModelId>,
+    target_configs: &BTreeMap<String, TargetConfig>,
 ) -> ServerResult<Arc<dyn Algorithm>> {
     match config {
         RouteConfig::Noop { .. } => Ok(Arc::new(Noop {})),
@@ -913,6 +978,30 @@ fn build_algorithm(
                     let strong =
                         resolve_target_model_id(route_name, &config.strong_target, targets)?;
                     let weak = resolve_target_model_id(route_name, &config.weak_target, targets)?;
+                    // Resolve the capability ladder, inheriting each rung's unit cost from
+                    // its target. Cost-aware routing requires every rung to declare a cost.
+                    let capability_targets = config
+                        .capability_targets
+                        .iter()
+                        .map(|rung| {
+                            let target =
+                                resolve_target_model_id(route_name, &rung.target, targets)?;
+                            let cost = target_configs
+                                .get(&rung.target)
+                                .and_then(|config| config.cost)
+                                .ok_or_else(|| {
+                                    ServerError::new(format!(
+                                        "llm_classifier route {route_name} capability target {:?} has no cost; cost-aware routing requires a cost on every rung",
+                                        rung.target
+                                    ))
+                                })?;
+                            Ok(libsy::CapabilityTarget {
+                                target,
+                                capability: rung.capability,
+                                cost,
+                            })
+                        })
+                        .collect::<ServerResult<Vec<_>>>()?;
                     let classifier_config = TaskClassifierConfig {
                         base_threshold: config.base_threshold,
                         threshold_step: config.threshold_step,
@@ -927,6 +1016,7 @@ fn build_algorithm(
                         judge_target: classifier,
                         efficient_target: weak,
                         capable_target: strong,
+                        capability_targets,
                         config: classifier_config,
                     })
                 }
@@ -1248,6 +1338,102 @@ target = "weak"
                 .contains("mode custom cannot use capability or escalation fields")
         );
     }
+
+    /// A capability-mode route with a priced four-rung ladder.
+    const LADDER_CONFIG: &str = r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[targets.judge]
+id = "judge/model"
+llm_client = "primary"
+
+[targets.nano]
+id = "nano/model"
+llm_client = "primary"
+cost = { input_per_1m = 0.10, output_per_1m = 0.10 }
+
+[targets.strong]
+id = "strong/model"
+llm_client = "primary"
+cost = { input_per_1m = 0.50, output_per_1m = 0.50 }
+
+[targets.ultra]
+id = "ultra/model"
+llm_client = "primary"
+cost = { input_per_1m = 1.00, output_per_1m = 1.00 }
+
+[targets.opus]
+id = "opus/model"
+llm_client = "primary"
+cost = { input_per_1m = 3.00, output_per_1m = 3.00 }
+
+[routes.ladder]
+id = "switchyard/ladder"
+type = "llm_classifier"
+classifier_target = "judge"
+base_threshold = 0.5
+capability_targets = [
+  { target = "nano", capability = 0.2 },
+  { target = "strong", capability = 0.5 },
+  { target = "ultra", capability = 0.8 },
+  { target = "opus", capability = 1.0 },
+]
+"#;
+
+        #[test]
+    fn a_capability_ladder_builds_cost_aware_routing() -> ServerResult<()> {
+        // The ladder parses and builds; strong/weak default to the ladder endpoints.
+        let state = server_state_from_toml(LADDER_CONFIG)?;
+        assert_eq!(state.models().collect::<Vec<_>>(), ["switchyard/ladder"]);
+        Ok(())
+    }
+
+
+    #[test]
+    fn a_capability_ladder_requires_a_cost_on_every_rung() {
+        // Drop nano's cost; the ladder can no longer order by price.
+        let missing_cost = LADDER_CONFIG.replace(
+            "[targets.nano]\nid = \"nano/model\"\nllm_client = \"primary\"\ncost = { input_per_1m = 0.10, output_per_1m = 0.10 }",
+            "[targets.nano]\nid = \"nano/model\"\nllm_client = \"primary\"",
+        );
+        assert!(error_message(&missing_cost).contains("has no cost"));
+    }
+
+
+    #[test]
+    fn a_capability_ladder_rejects_an_out_of_range_capability() {
+        let out_of_range = LADDER_CONFIG.replace(
+            "{ target = \"strong\", capability = 0.5 }",
+            "{ target = \"strong\", capability = 1.5 }",
+        );
+        assert!(error_message(&out_of_range).contains("must be between 0 and 1"));
+    }
+
+
+    #[test]
+    fn capability_targets_are_rejected_in_escalation_and_custom_modes() {
+        let escalation = VALID_CONFIG.replace(
+            "base_threshold = 0.5",
+            "base_threshold = 0.5\nescalation = { confirmations = 2 }\ncapability_targets = [ { target = \"strong\", capability = 1.0 } ]",
+        );
+        assert!(
+            error_message(&escalation).contains("mode escalation cannot use capability_targets")
+        );
+
+        let custom = VALID_CONFIG.replace(
+            "base_threshold = 0.5",
+            "mode = \"custom\"\ncapability_targets = [ { target = \"strong\", capability = 1.0 } ]",
+        );
+        assert!(
+            error_message(&custom)
+                .contains("mode custom cannot use capability or escalation fields")
+        );
+    }
+
 
     #[test]
     fn rejects_unknown_fields_and_algorithm_types() {
