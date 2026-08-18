@@ -57,14 +57,23 @@ pub(crate) struct ServerArgs {
     routing_log_file: Option<PathBuf>,
 
     /// Append best-effort transcript events (normalized + provider payloads) to this JSONL file.
+    ///
+    /// Records may contain prompts, tool arguments, and tool output. The file is
+    /// created owner-only; retention and access control are the operator's
+    /// responsibility.
     #[arg(long, value_name = "PATH")]
     transcript_log_file: Option<PathBuf>,
 
-    /// Redaction mode applied to transcript records.
+    /// Redaction mode for transcript records: strict, balanced, or off.
+    ///
+    /// strict redacts credential-like keys and free text; balanced keeps free
+    /// text but still redacts suspicious keys and bare credentials; off disables
+    /// redaction (string truncation still applies).
     #[arg(long, value_name = "MODE", default_value = "strict")]
     transcript_redaction: String,
 
-    /// Store full unredacted provider JSON in transcript records (unsafe).
+    /// Store full unredacted provider JSON in transcript records (UNSAFE: writes
+    /// secrets and prompts verbatim to disk).
     #[arg(long)]
     transcript_unsafe_full_raw: bool,
 

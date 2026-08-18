@@ -179,8 +179,7 @@ struct SharedRoutingLog {
 
 #[derive(Clone)]
 struct SharedTranscriptLog {
-    writer: Arc<Mutex<transcript_log::TranscriptLog>>,
-    path: PathBuf,
+    writer: Arc<transcript_log::TranscriptLog>,
 }
 
 impl SharedRoutingLog {
@@ -219,19 +218,27 @@ impl SharedRoutingLog {
 
 impl SharedTranscriptLog {
     fn new(path: PathBuf, policy: transcript_log::TranscriptPolicy) -> ServerResult<Self> {
+        // Surface the privacy posture at construction so an operator who enables
+        // transcript logging always sees what will be persisted.
+        if policy.unsafe_full_raw {
+            tracing::warn!(
+                path = %path.display(),
+                "transcript logging enabled with unsafe_full_raw: unredacted provider payloads (prompts, tool output, secrets) will be written to disk"
+            );
+        } else {
+            tracing::info!(
+                path = %path.display(),
+                policy = %policy.privacy_summary(),
+                "transcript logging enabled; records may contain prompts and tool content — restrict access and set retention"
+            );
+        }
         Ok(Self {
-            writer: Arc::new(Mutex::new(transcript_log::TranscriptLog::new(
-                path.clone(),
-                policy,
-            )?)),
-            path,
+            writer: Arc::new(transcript_log::TranscriptLog::new(path.clone(), policy)?),
         })
     }
 
     fn append(&self, record: &transcript_log::TranscriptRecord) {
-        if let Err(error) = self.writer.lock().append(record) {
-            tracing::warn!(path = %self.path.display(), %error, "transcript log append failed");
-        }
+        self.writer.append(record);
     }
 }
 

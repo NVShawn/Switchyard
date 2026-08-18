@@ -2179,12 +2179,9 @@ async fn transcript_log_records_normalized_request_and_response() -> TestResult 
     let response = app.clone().oneshot(request).await?;
     assert_eq!(response.status(), StatusCode::OK);
 
-    let records = std::fs::read_to_string(&transcript_path)?;
-    let events: Vec<Value> = records
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(serde_json::from_str)
-        .collect::<Result<_, _>>()?;
+    // Transcript writes are asynchronous (background writer thread); poll until
+    // both expected events are durable or the deadline passes.
+    let events = poll_transcript_events(&transcript_path, 2).await?;
 
     let kinds: Vec<&str> = events
         .iter()
@@ -2206,6 +2203,25 @@ async fn transcript_log_records_normalized_request_and_response() -> TestResult 
         assert_eq!(event["wire_format"], "openai_chat");
     }
     Ok(())
+}
+
+/// Polls the transcript file until it holds at least `expected` parseable events
+/// or a short deadline elapses, tolerating the asynchronous background writer.
+async fn poll_transcript_events(path: &std::path::Path, expected: usize) -> TestResult<Vec<Value>> {
+    for _ in 0..100 {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let events: Vec<Value> = contents
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            if events.len() >= expected {
+                return Ok(events);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Err("transcript did not reach the expected event count".into())
 }
 
 /// A capability ladder with per-rung pricing, built from a TOML deployment so the
