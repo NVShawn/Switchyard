@@ -11,6 +11,7 @@ mod routing_log;
 mod shutdown;
 mod sse;
 mod stats;
+mod transcript_log;
 mod usage_metrics;
 
 use std::collections::BTreeMap;
@@ -37,6 +38,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use switchyard_llm_client::{ClientRouter, RunObservation, RunObserver, TranslatingLlmClient};
+use switchyard_protocol::ResponseAccumulator;
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, TargetCost, Usage};
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
@@ -161,6 +163,7 @@ pub struct ServerState {
     metrics: prometheus::Registry,
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
+    transcript_log: Option<SharedTranscriptLog>,
     track_cache_eligibility: bool,
     /// Per-model unit pricing, for cost and reward accounting in the routing log.
     costs: Arc<BTreeMap<ModelId, TargetCost>>,
@@ -172,6 +175,11 @@ pub struct ServerState {
 struct SharedRoutingLog {
     writer: Arc<Mutex<routing_log::RoutingLog>>,
     path: PathBuf,
+}
+
+#[derive(Clone)]
+struct SharedTranscriptLog {
+    writer: Arc<transcript_log::TranscriptLog>,
 }
 
 impl SharedRoutingLog {
@@ -205,6 +213,32 @@ impl SharedRoutingLog {
         session_id: &str,
     ) -> std::io::Result<Option<routing_log::SessionStatsSnapshot>> {
         routing_log::snapshot(&self.path, session_id)
+    }
+}
+
+impl SharedTranscriptLog {
+    fn new(path: PathBuf, policy: transcript_log::TranscriptPolicy) -> ServerResult<Self> {
+        // Surface the privacy posture at construction so an operator who enables
+        // transcript logging always sees what will be persisted.
+        if policy.unsafe_full_raw {
+            tracing::warn!(
+                path = %path.display(),
+                "transcript logging enabled with unsafe_full_raw: unredacted provider payloads (prompts, tool output, secrets) will be written to disk"
+            );
+        } else {
+            tracing::info!(
+                path = %path.display(),
+                policy = %policy.privacy_summary(),
+                "transcript logging enabled; records may contain prompts and tool content — restrict access and set retention"
+            );
+        }
+        Ok(Self {
+            writer: Arc::new(transcript_log::TranscriptLog::new(path.clone(), policy)?),
+        })
+    }
+
+    fn append(&self, record: &transcript_log::TranscriptRecord) {
+        self.writer.append(record);
     }
 }
 
@@ -270,6 +304,7 @@ impl ServerState {
             metrics,
             stats,
             routing_log: None,
+            transcript_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
             costs: Arc::new(BTreeMap::new()),
             bandit: None,
@@ -279,6 +314,43 @@ impl ServerState {
     /// Enables durable per-request routing records at `path`.
     pub fn with_routing_log(mut self, path: impl Into<PathBuf>) -> ServerResult<Self> {
         self.routing_log = Some(SharedRoutingLog::new(path.into())?);
+        Ok(self)
+    }
+
+    /// Enables best-effort transcript events at `path`.
+    pub fn with_transcript_log(mut self, path: impl Into<PathBuf>) -> ServerResult<Self> {
+        self.transcript_log = Some(SharedTranscriptLog::new(
+            path.into(),
+            transcript_log::TranscriptPolicy::default(),
+        )?);
+        Ok(self)
+    }
+
+    /// Enables best-effort transcript events using an explicit safety policy.
+    pub fn with_transcript_log_policy(
+        mut self,
+        path: impl Into<PathBuf>,
+        redaction: &str,
+        unsafe_full_raw: bool,
+        max_bytes_per_record: usize,
+    ) -> ServerResult<Self> {
+        let redaction = match redaction {
+            "strict" => transcript_log::RedactionMode::Strict,
+            "balanced" => transcript_log::RedactionMode::Balanced,
+            "off" => transcript_log::RedactionMode::Off,
+            value => {
+                return Err(ServerError::new(format!(
+                    "invalid transcript redaction mode {value}"
+                )));
+            }
+        };
+        let policy = transcript_log::TranscriptPolicy {
+            redaction,
+            unsafe_full_raw,
+            max_bytes_per_record,
+            ..transcript_log::TranscriptPolicy::default()
+        };
+        self.transcript_log = Some(SharedTranscriptLog::new(path.into(), policy)?);
         Ok(self)
     }
 
@@ -790,6 +862,57 @@ fn resolve_route(
 ) -> std::result::Result<(&RouteEntry, Request), Response> {
     let llm_request = decode_request(wire_format, &body)
         .map_err(|error| invalid_body_error(error.to_string()))?;
+
+    if let Some(transcript_log) = state.transcript_log.as_ref() {
+        let request_id = metadata
+            .correlation_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let normalized = serde_json::to_value(&llm_request).unwrap_or(Value::Null);
+        let record = transcript_log::TranscriptRecord {
+            v: transcript_log::TRANSCRIPT_SCHEMA_VERSION,
+            ts: transcript_log::now_rfc3339_millis(),
+            event: transcript_log::TranscriptEventKind::NormalizedRequest,
+            request_id: request_id.clone(),
+            session_id: metadata.session_id.clone(),
+            trial_id: None,
+            wire_format: wire_format.as_str().to_string(),
+            tools_hash: None,
+            route_id: None,
+            selected_model: None,
+            tier: None,
+            streaming: Some(llm_request.stream),
+            normalized: Some(normalized),
+            raw: None,
+            error: None,
+        };
+        transcript_log.append(&record);
+
+        if let Some(raw) = llm_request
+            .preservation
+            .requests
+            .get(&switchyard_protocol::FormatId::known(wire_format))
+        {
+            let provider = transcript_log::TranscriptRecord {
+                v: transcript_log::TRANSCRIPT_SCHEMA_VERSION,
+                ts: transcript_log::now_rfc3339_millis(),
+                event: transcript_log::TranscriptEventKind::ProviderRequest,
+                request_id,
+                session_id: metadata.session_id.clone(),
+                trial_id: None,
+                wire_format: wire_format.as_str().to_string(),
+                tools_hash: None,
+                route_id: None,
+                selected_model: None,
+                tier: None,
+                streaming: Some(llm_request.stream),
+                normalized: None,
+                raw: Some(raw.clone()),
+                error: None,
+            };
+            transcript_log.append(&provider);
+        }
+    }
     let requested_model = llm_request
         .model
         .clone()
@@ -843,6 +966,11 @@ async fn handle_llm_request(
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
     let cache_probe = state.track_cache_eligibility.then(|| prefix_probe(&body));
+    let transcript_request_id = metadata
+        .correlation_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let transcript_session_id = metadata.session_id.clone();
     let (route, request) = match resolve_route(&state, metadata, body, wire_format) {
         Ok(resolved) => resolved,
         Err(response) => return response,
@@ -861,7 +989,32 @@ async fn handle_llm_request(
     let (trace, response) =
         match switchyard_llm_client::run(algorithm, client_router, request, Some(observer)).await {
             Ok(result) => result,
-            Err(error) => return algorithm_error(error),
+            Err(error) => {
+                if let Some(transcript_log) = state.transcript_log.as_ref() {
+                    let record = transcript_log::TranscriptRecord {
+                        v: transcript_log::TRANSCRIPT_SCHEMA_VERSION,
+                        ts: transcript_log::now_rfc3339_millis(),
+                        event: transcript_log::TranscriptEventKind::Error,
+                        request_id: transcript_request_id.clone(),
+                        session_id: transcript_session_id.clone(),
+                        trial_id: None,
+                        wire_format: wire_format.as_str().to_string(),
+                        tools_hash: None,
+                        route_id: None,
+                        selected_model: None,
+                        tier: None,
+                        streaming: None,
+                        normalized: None,
+                        raw: None,
+                        error: Some(serde_json::json!({
+                            "kind": "algorithm",
+                            "message": error.to_string(),
+                        })),
+                    };
+                    transcript_log.append(&record);
+                }
+                return algorithm_error(error);
+            }
         };
     let decision = trace.last();
     // The response carries the candidate that actually served it. Fall back to the routing
@@ -884,6 +1037,117 @@ async fn handle_llm_request(
             state.routing_log.zip(routing_log_context),
             state.costs.get(served_model).copied(),
         )
+    } else {
+        response
+    };
+
+    let response = if let Some(transcript_log) = state.transcript_log.clone() {
+        let request_id = transcript_request_id.clone();
+        let session_id = transcript_session_id.clone();
+        let selected_model = served_model.as_ref().map(ToString::to_string);
+        let wire = wire_format.as_str().to_string();
+        match response.llm_response {
+            switchyard_protocol::LlmResponse::Agg(agg) => {
+                let normalized = serde_json::to_value(&agg).unwrap_or(Value::Null);
+                if let Some(raw) = agg
+                    .preservation
+                    .responses
+                    .get(&switchyard_protocol::FormatId::known(wire_format))
+                {
+                    let provider = transcript_log::TranscriptRecord {
+                        v: transcript_log::TRANSCRIPT_SCHEMA_VERSION,
+                        ts: transcript_log::now_rfc3339_millis(),
+                        event: transcript_log::TranscriptEventKind::ProviderResponse,
+                        request_id: request_id.clone(),
+                        session_id: session_id.clone(),
+                        trial_id: None,
+                        wire_format: wire.clone(),
+                        tools_hash: None,
+                        route_id: None,
+                        selected_model: selected_model.clone(),
+                        tier: None,
+                        streaming: Some(false),
+                        normalized: None,
+                        raw: Some(raw.clone()),
+                        error: None,
+                    };
+                    transcript_log.append(&provider);
+                }
+                let record = transcript_log::TranscriptRecord {
+                    v: transcript_log::TRANSCRIPT_SCHEMA_VERSION,
+                    ts: transcript_log::now_rfc3339_millis(),
+                    event: transcript_log::TranscriptEventKind::NormalizedResponse,
+                    request_id,
+                    session_id,
+                    trial_id: None,
+                    wire_format: wire,
+                    tools_hash: None,
+                    route_id: None,
+                    selected_model,
+                    tier: None,
+                    streaming: Some(false),
+                    normalized: Some(normalized),
+                    raw: None,
+                    error: None,
+                };
+                transcript_log.append(&record);
+                switchyard_protocol::Response {
+                    llm_response: switchyard_protocol::LlmResponse::Agg(agg),
+                    metadata: response.metadata,
+                }
+            }
+            switchyard_protocol::LlmResponse::Stream(mut stream) => {
+                let wrapped = async_stream::stream! {
+                    use futures_util::StreamExt as _;
+                    let mut accumulator = ResponseAccumulator::new();
+                    while let Some(item) = stream.next().await {
+                        if let Ok(event) = &item {
+                            for chunk in event.normalized() {
+                                accumulator.push(chunk.clone());
+                            }
+                        }
+                        let failed = match &item {
+                            Err(_) => true,
+                            Ok(event) => event.normalized().iter().any(|chunk| {
+                                matches!(
+                                    chunk,
+                                    switchyard_protocol::LlmResponseChunk::StreamError { .. }
+                                        | switchyard_protocol::LlmResponseChunk::DecodeError { .. }
+                                )
+                            }),
+                        };
+                        yield item;
+                        if failed {
+                            break;
+                        }
+                    }
+                    let agg = accumulator.finish();
+                    let normalized = serde_json::to_value(&agg).unwrap_or(Value::Null);
+                    let record = transcript_log::TranscriptRecord {
+                        v: transcript_log::TRANSCRIPT_SCHEMA_VERSION,
+                        ts: transcript_log::now_rfc3339_millis(),
+                        event: transcript_log::TranscriptEventKind::NormalizedResponse,
+                        request_id,
+                        session_id,
+                        trial_id: None,
+                        wire_format: wire,
+                        tools_hash: None,
+                        route_id: None,
+                        selected_model,
+                        tier: None,
+                        streaming: Some(true),
+                        normalized: Some(normalized),
+                        raw: None,
+                        error: None,
+                    };
+                    transcript_log.append(&record);
+                };
+                switchyard_protocol::Response {
+                    llm_response: switchyard_protocol::LlmResponse::Stream(Box::pin(wrapped)),
+                    metadata: response.metadata,
+                }
+            }
+        }
     } else {
         response
     };
@@ -982,6 +1246,11 @@ fn request_log_level(status: StatusCode) -> Level {
 
 fn metadata_from_headers(headers: HeaderMap) -> Metadata {
     let mut metadata = Metadata::from_headers(&headers);
+    metadata.correlation_id = Some(
+        metadata
+            .correlation_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+    );
     metadata.http_headers = Some(headers);
     metadata
 }

@@ -4,7 +4,9 @@
 """Tests for the offline dream-step label and calibration tooling."""
 
 import json
+from pathlib import Path
 
+from switchyard.cli.switchyard_cli import _build_parser
 from switchyard.dream import (
     brier_score,
     cheap_wrong_rate,
@@ -13,6 +15,12 @@ from switchyard.dream import (
     read_records,
     summarize_arms,
     teacher_calibration,
+)
+from switchyard.dream_mining import (
+    build_mining_report,
+    infer_transcript_path,
+    read_transcript_intents,
+    write_mining_artifacts,
 )
 
 
@@ -142,3 +150,103 @@ def test_emit_labels_include_the_logged_judge_verdict():
     assert labels[0]["judge_verdict"]["p_solve"] == 0.8
     assert labels[0]["judge_verdict"]["capability_boundary"] == "supported"
     assert labels[0]["label"]["minimum_capability"] == 0.2
+
+
+def test_dream_cli_exposes_transcript_mining_flags(tmp_path: Path) -> None:
+    args = _build_parser().parse_args(
+        [
+            "dream",
+            "--log",
+            str(tmp_path / "routing.jsonl"),
+            "--transcript",
+            str(tmp_path / "transcript.jsonl"),
+            "--mine",
+            "--emit-skills",
+            "--emit-tools",
+        ]
+    )
+
+    assert args.transcript == tmp_path / "transcript.jsonl"
+    assert args.mine is True
+    assert args.emit_skills is True
+    assert args.emit_tools is True
+
+
+def test_infer_transcript_path_matches_server_naming(tmp_path: Path) -> None:
+    assert infer_transcript_path(tmp_path / "routing.jsonl") == (
+        tmp_path / "routing.transcript.jsonl"
+    )
+
+
+def test_read_transcript_intents_normalizes_tools_and_bash_commands(tmp_path: Path) -> None:
+    transcript = tmp_path / "transcript.jsonl"
+    records = [
+        {
+            "event": "normalized_response",
+            "request_id": "request-1",
+            "session_id": "session-1",
+            "normalized": {
+                "outputs": [
+                    {
+                        "content": [
+                            {
+                                "type": "tool_call",
+                                "id": "call-1",
+                                "name": "shell",
+                                "arguments": {"command": "rg   'needle' src"},
+                            },
+                            {
+                                "type": "tool_call",
+                                "id": "call-2",
+                                "name": "read_file",
+                                "arguments": {"path": "a.py", "line": 3},
+                            },
+                        ]
+                    }
+                ]
+            },
+        },
+        {"event": "provider_response", "session_id": "session-1", "raw": {}},
+    ]
+    transcript.write_text("\n".join(json.dumps(record) for record in records))
+
+    assert read_transcript_intents(transcript) == {
+        "session-1": [
+            {"kind": "bash_search", "tool": "shell", "command": "rg needle src"},
+            {
+                "kind": "tool_call",
+                "tool": "read_file",
+                "arguments": {"line": 3, "path": "a.py"},
+            },
+        ]
+    }
+
+
+def test_mining_report_detects_session_local_duplicates_deterministically(tmp_path: Path) -> None:
+    intent = {"kind": "bash_read", "tool": "bash", "command": "cat file.py"}
+    sessions = {"session-b": [intent], "session-a": [intent, intent]}
+
+    report = build_mining_report(sessions, tmp_path / "transcript.jsonl")
+
+    assert report["exact_duplicate_count"] == 1
+    assert [session["session_id"] for session in report["sessions"]] == [
+        "session-a",
+        "session-b",
+    ]
+    assert report["sessions"][0]["duplicate_intents"] == [{"intent": intent, "count": 2}]
+    assert report["sessions"][1]["duplicate_intents"] == []
+
+
+def test_write_mining_artifacts_emits_versioned_drafts(tmp_path: Path) -> None:
+    intent = {"kind": "tool_call", "tool": "read_file", "arguments": {"path": "a.py"}}
+    report = build_mining_report({"session": [intent, intent]}, tmp_path / "transcript.jsonl")
+
+    write_mining_artifacts(tmp_path, report, emit_skills=True, emit_tools=True)
+
+    persisted = json.loads((tmp_path / "mining_report.json").read_text())
+    assert persisted["version"] == 1
+    assert "Exact duplicates: 1" in (tmp_path / "mining_report.md").read_text()
+    skill = next((tmp_path / "generated_skills").glob("*.md"))
+    tool = next((tmp_path / "generated_tools").glob("*.json"))
+    assert "version: 1" in skill.read_text()
+    assert json.loads(tool.read_text())["version"] == 1
