@@ -46,4 +46,3 @@ def test_mining_endpoint_reports_absent(tmp_path):
 
     client = TestClient(build_app(root=tmp_path))
     assert client.get(f"/api/runs/{bundle.name}/mining").json() == {"available": False}
-
