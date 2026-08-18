@@ -13,7 +13,7 @@ from switchyard.cli.launch_command import (
     cmd_launch_codex,
     cmd_launch_openclaw,
 )
-from switchyard.dream import cmd_dream
+from switchyard.dream import cmd_dream_ui
 
 
 def _add_launch_parser(
@@ -77,6 +77,27 @@ def _add_dream_parser(
         help="Re-judge each logged task with this OpenAI-compatible model.",
     )
     dream.add_argument(
+        "--transcript",
+        type=Path,
+        metavar="PATH",
+        help="Transcript event JSONL (default: inferred from --log).",
+    )
+    dream.add_argument(
+        "--mine",
+        action="store_true",
+        help="Mine transcript tool-call intents and exact duplicates.",
+    )
+    dream.add_argument(
+        "--emit-skills",
+        action="store_true",
+        help="Emit draft skills for repeated intents (implies --mine).",
+    )
+    dream.add_argument(
+        "--emit-tools",
+        action="store_true",
+        help="Emit draft tools for repeated intents (implies --mine).",
+    )
+    dream.add_argument(
         "--base-url",
         default="https://api.openai.com/v1",
         help="OpenAI-compatible base URL for the strong model.",
@@ -85,7 +106,23 @@ def _add_dream_parser(
         "--api-key",
         help="API key for the strong model (default: $OPENAI_API_KEY).",
     )
-    dream.set_defaults(func=cmd_dream)
+    dream.add_argument(
+        "--ui",
+        action="store_true",
+        help="Serve a local web UI to explore the dream run (binds to 127.0.0.1).",
+    )
+    dream.add_argument(
+        "--ui-host",
+        default="127.0.0.1",
+        help="Host interface for the dream UI (default: 127.0.0.1).",
+    )
+    dream.add_argument(
+        "--ui-port",
+        type=int,
+        default=8008,
+        help="Port for the dream UI (default: 8008).",
+    )
+    dream.set_defaults(func=cmd_dream_ui)
 
 
 def _build_parser() -> argparse.ArgumentParser:

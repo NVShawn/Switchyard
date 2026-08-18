@@ -4,10 +4,14 @@
 //! CLI entrypoint for running the configured libsy server.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn infer_transcript_path(routing_log: &Path) -> PathBuf {
+    routing_log.with_file_name("routing.transcript.jsonl")
+}
 
 use clap::Parser;
-use switchyard_server::config::load_server_state;
+use switchyard_server::config::{load_server_log_options, load_server_state};
 use switchyard_server::{
     DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT, DEFAULT_LISTEN_BACKLOG, ServerError, ServerResult,
     ServerRunOptions, ServerState, TlsOptions, run_server,
@@ -52,6 +56,22 @@ pub(crate) struct ServerArgs {
     #[arg(long, value_name = "PATH")]
     routing_log_file: Option<PathBuf>,
 
+    /// Append best-effort transcript events (normalized + provider payloads) to this JSONL file.
+    #[arg(long, value_name = "PATH")]
+    transcript_log_file: Option<PathBuf>,
+
+    /// Redaction mode applied to transcript records.
+    #[arg(long, value_name = "MODE", default_value = "strict")]
+    transcript_redaction: String,
+
+    /// Store full unredacted provider JSON in transcript records (unsafe).
+    #[arg(long)]
+    transcript_unsafe_full_raw: bool,
+
+    /// Maximum serialized bytes retained per transcript record.
+    #[arg(long, value_name = "BYTES", default_value_t = 262144)]
+    transcript_max_bytes_per_record: usize,
+
     /// TLS certificate path in PEM format.
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -69,8 +89,34 @@ impl ServerArgs {
 
     fn into_runtime(self) -> ServerResult<(ServerState, ServerRunOptions)> {
         let mut state = load_server_state(&self.config)?;
-        if let Some(path) = self.routing_log_file {
+        let toml_logs = load_server_log_options(&self.config)?;
+
+        let routing_path = self.routing_log_file.clone().or(toml_logs.routing_log_file);
+        let transcript_path = self
+            .transcript_log_file
+            .clone()
+            .or(toml_logs.transcript_log_file)
+            .or_else(|| routing_path.as_deref().map(infer_transcript_path));
+
+        if let Some(path) = routing_path {
             state = state.with_routing_log(path)?;
+        }
+        if let Some(path) = transcript_path {
+            let redaction = toml_logs
+                .transcript_redaction
+                .filter(|_| self.transcript_redaction == "strict")
+                .unwrap_or(self.transcript_redaction);
+            let unsafe_full_raw = self.transcript_unsafe_full_raw
+                || toml_logs.transcript_unsafe_full_raw.unwrap_or(false);
+            let max_bytes = if self.transcript_max_bytes_per_record != 262144 {
+                self.transcript_max_bytes_per_record
+            } else {
+                toml_logs
+                    .transcript_max_bytes_per_record
+                    .unwrap_or(self.transcript_max_bytes_per_record)
+            };
+            state =
+                state.with_transcript_log_policy(path, &redaction, unsafe_full_raw, max_bytes)?;
         }
         let tls = match (self.tls_cert, self.tls_key) {
             (Some(cert), Some(key)) => {

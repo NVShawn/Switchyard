@@ -21,11 +21,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import urllib.request
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from switchyard.dream_mining import (
+    build_mining_report,
+    infer_transcript_path,
+    read_transcript_intents,
+    write_mining_artifacts,
+)
 
 # Tier label the server writes for judge/classifier calls, which are not bandit arms.
 _CLASSIFIER_TIER = "classifier"
@@ -268,10 +278,38 @@ def teacher_calibration(labels: list[dict[str, Any]]) -> float:
     return brier_score(predictions)
 
 
-def cmd_dream(args: argparse.Namespace) -> None:
-    """Run the dream step over a routing log."""
+def _build_run_bundle(*, log_path: Path, out_path: Path) -> Path:
+    out_path = out_path.resolve()
+    parent = out_path.parent
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    bundle_dir = parent / f"{out_path.name}.{run_id}.dream"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = {
+        "id": run_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "log": str(log_path.resolve()),
+        "out": str(out_path),
+    }
+    (bundle_dir / "dream_run.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+    try:
+        shutil.copyfile(log_path, bundle_dir / "routing.jsonl")
+    except Exception:
+        pass
+
+    return bundle_dir
+
+
+def cmd_dream(args: argparse.Namespace) -> Path:
+    """Run the dream step over a routing log.
+
+    Returns the bundle directory used to store artifacts for later inspection.
+    """
     records = read_records(args.log)
     arms = summarize_arms(records)
+
+    bundle_dir = _build_run_bundle(log_path=args.log, out_path=args.out)
 
     print(f"read {len(records)} records, {len(arms)} bandit arms")
     for arm in sorted(arms.values(), key=lambda a: (a.token_bucket, a.mean)):
@@ -285,6 +323,22 @@ def cmd_dream(args: argparse.Namespace) -> None:
     if any(r.get("judge_p_solve") is not None for r in records):
         print(f"serving-judge calibration (Brier, lower is better): {judged:.4f}")
 
+    mine = args.mine or args.emit_skills or args.emit_tools
+    if mine:
+        transcript_path = args.transcript or infer_transcript_path(args.log)
+        sessions = read_transcript_intents(transcript_path)
+        report = build_mining_report(sessions, transcript_path)
+        write_mining_artifacts(
+            bundle_dir,
+            report,
+            emit_skills=args.emit_skills,
+            emit_tools=args.emit_tools,
+        )
+        print(
+            f"mined {report['intent_count']} intents across {report['session_count']} sessions; "
+            f"found {report['exact_duplicate_count']} exact duplicates"
+        )
+
     if args.strong_model:
         import os
 
@@ -295,6 +349,25 @@ def cmd_dream(args: argparse.Namespace) -> None:
         )
         labels = emit_labels(records, judge)
         out = args.out
-        out.write_text("".join(json.dumps(label) + "\n" for label in labels))
+        serialized = "".join(json.dumps(label) + "\n" for label in labels)
+        out.write_text(serialized)
+        (bundle_dir / "labels.jsonl").write_text(serialized, encoding="utf-8")
         print(f"wrote {len(labels)} fine-tune labels to {out}")
         print(f"teacher calibration (Brier, lower is better): {teacher_calibration(labels):.4f}")
+
+    return bundle_dir
+
+
+def cmd_dream_ui(args: argparse.Namespace) -> None:
+    """Run the dream step and serve a local web UI to explore the results."""
+    bundle_dir = cmd_dream(args)
+
+    from switchyard.cli.dream_ui import serve_dream_ui
+
+    raise SystemExit(
+        serve_dream_ui(
+            host=args.ui_host,
+            port=args.ui_port,
+            initial_bundle=bundle_dir,
+        )
+    )

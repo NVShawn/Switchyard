@@ -2156,6 +2156,58 @@ async fn routing_log_prefers_canonical_and_preserves_legacy_fallback() -> TestRe
     Ok(())
 }
 
+/// The transcript log captures normalized request and response events, correlated
+/// by a server-generated request id, with tool calls preserved for offline mining.
+#[tokio::test]
+async fn transcript_log_records_normalized_request_and_response() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let temp_dir = tempfile::tempdir()?;
+    let transcript_path = temp_dir.path().join("routing.transcript.jsonl");
+    let state = random_state(&upstream.base_url, &[(ROUTE_MODEL, &["model/a"])])?
+        .with_transcript_log(&transcript_path)?;
+    let app = build_switchyard_router(state);
+
+    let request = HttpRequest::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-switchyard-session-id", "session-1")
+        .body(Body::from(serde_json::to_vec(&json!({
+            "model": ROUTE_MODEL,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))?))?;
+    let response = app.clone().oneshot(request).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let records = std::fs::read_to_string(&transcript_path)?;
+    let events: Vec<Value> = records
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+
+    let kinds: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["event"].as_str())
+        .collect();
+    assert!(kinds.contains(&"normalized_request"));
+    assert!(kinds.contains(&"normalized_response"));
+
+    let request_ids: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|event| event["request_id"].as_str())
+        .collect();
+    assert_eq!(request_ids.len(), 1, "events share one request id");
+    assert!(request_ids.iter().all(|id| !id.is_empty()));
+
+    for event in &events {
+        assert_eq!(event["v"], 1);
+        assert_eq!(event["session_id"], "session-1");
+        assert_eq!(event["wire_format"], "openai_chat");
+    }
+    Ok(())
+}
+
 /// A capability ladder with per-rung pricing, built from a TOML deployment so the
 /// server threads each target's cost into the routing record.
 #[tokio::test]

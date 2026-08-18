@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use libsy::{
@@ -50,14 +50,68 @@ fn server_state_from_toml(toml: &str) -> ServerResult<ServerState> {
     config.build()
 }
 
+/// Reads server-level logging options from a TOML deployment file.
+pub fn load_server_log_options(path: impl AsRef<Path>) -> ServerResult<ServerLogOptions> {
+    let path = path.as_ref();
+    let toml = fs::read_to_string(path).map_err(|error| {
+        ServerError::new(format!(
+            "failed to read server config {}: {error}",
+            path.display()
+        ))
+    })?;
+    let config: ServerConfig = toml::from_str(&toml).map_err(|error| {
+        ServerError::new(format!("invalid server config {}: {error}", path.display()))
+    })?;
+    Ok(ServerLogOptions {
+        routing_log_file: config.server.routing_log_file,
+        transcript_log_file: config.server.transcript_log_file,
+        transcript_redaction: config.server.transcript_redaction,
+        transcript_unsafe_full_raw: config.server.transcript_unsafe_full_raw,
+        transcript_max_bytes_per_record: config.server.transcript_max_bytes_per_record,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServerConfig {
     schema_version: u32,
     #[serde(default)]
+    server: ServerRuntimeConfig,
+    #[serde(default)]
     llm_clients: BTreeMap<String, LlmClientConfig>,
     targets: BTreeMap<String, TargetConfig>,
     routes: BTreeMap<String, RouteConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerRuntimeConfig {
+    #[serde(default)]
+    routing_log_file: Option<PathBuf>,
+    #[serde(default)]
+    transcript_log_file: Option<PathBuf>,
+    #[serde(default)]
+    transcript_redaction: Option<String>,
+    #[serde(default)]
+    transcript_unsafe_full_raw: Option<bool>,
+    #[serde(default)]
+    transcript_max_bytes_per_record: Option<usize>,
+}
+
+/// Server-level logging options declared in the deployment TOML, applied unless a
+/// CLI flag overrides them.
+#[derive(Clone, Debug, Default)]
+pub struct ServerLogOptions {
+    /// Durable per-request routing log path.
+    pub routing_log_file: Option<PathBuf>,
+    /// Best-effort transcript log path.
+    pub transcript_log_file: Option<PathBuf>,
+    /// Transcript redaction mode: `strict`, `balanced`, or `off`.
+    pub transcript_redaction: Option<String>,
+    /// Whether to store full unredacted provider JSON.
+    pub transcript_unsafe_full_raw: Option<bool>,
+    /// Maximum serialized bytes retained per transcript record.
+    pub transcript_max_bytes_per_record: Option<usize>,
 }
 
 impl ServerConfig {
