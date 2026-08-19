@@ -134,6 +134,7 @@ impl RoutingLog {
             trial_id: context.trial_id.map(Cow::Owned),
             session_id: context.session_id.map(Cow::Owned),
             request_id: context.request_id.map(Cow::Owned),
+            route_id: context.route_id.map(Cow::Owned),
             model: model.into(),
             tier: tier.unwrap_or("").into(),
             prompt_tokens: usage.prompt_tokens,
@@ -241,6 +242,7 @@ pub(crate) struct RoutingLogContext {
     trial_id: Option<String>,
     session_id: Option<String>,
     request_id: Option<String>,
+    route_id: Option<String>,
     token_bucket: Option<String>,
 }
 
@@ -261,8 +263,15 @@ impl RoutingLogContext {
                     .map(str::to_string)
             }),
             request_id: metadata.correlation_id.clone(),
+            route_id: None,
             token_bucket: None,
         }
+    }
+
+    /// Records the route ID the caller addressed before the classifier selected a target.
+    pub(crate) fn with_route_id(mut self, route_id: impl Into<String>) -> Self {
+        self.route_id = Some(route_id.into());
+        self
     }
 
     /// Records the bandit's token bucket, labelled from the request's estimated size.
@@ -287,6 +296,8 @@ struct RoutingRecord<'a> {
     session_id: Option<Cow<'a, str>>,
     #[serde(borrow)]
     request_id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    route_id: Option<Cow<'a, str>>,
     model: Cow<'a, str>,
     tier: Cow<'a, str>,
     prompt_tokens: u64,

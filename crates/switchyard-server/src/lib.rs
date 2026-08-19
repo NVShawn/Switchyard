@@ -141,6 +141,20 @@ impl CallerAuthKind {
                 )
         )
     }
+
+    fn has_credential(self, headers: Option<&HeaderMap>) -> bool {
+        let Some(headers) = headers else {
+            return false;
+        };
+        match self {
+            Self::OpenAi => headers
+                .get("authorization")
+                .is_some_and(|value| !value.is_empty()),
+            Self::Anthropic => ["authorization", "x-api-key"]
+                .iter()
+                .any(|name| headers.get(*name).is_some_and(|value| !value.is_empty())),
+        }
+    }
 }
 
 /// Exact upstream model used by the server's Anthropic token-count endpoint.
@@ -933,21 +947,35 @@ fn resolve_route(
             "model_not_found",
         )
     })?;
-    if let Some(caller_auth) = route.caller_auth
-        && !caller_auth.accepts(wire_format)
-    {
-        let (provider, expected_endpoint) = match caller_auth {
-            CallerAuthKind::Anthropic => ("Anthropic", "/v1/messages"),
-            CallerAuthKind::OpenAi => ("OpenAI", "/v1/chat/completions or /v1/responses"),
-        };
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "route {requested_model} forwards an {provider} login; call it through {expected_endpoint}",
-            ),
-            "invalid_request_error",
-            "invalid_request_error",
-        ));
+    if let Some(caller_auth) = route.caller_auth {
+        if !caller_auth.accepts(wire_format) {
+            let (provider, expected_endpoint) = match caller_auth {
+                CallerAuthKind::Anthropic => ("Anthropic", "/v1/messages"),
+                CallerAuthKind::OpenAi => ("OpenAI", "/v1/chat/completions or /v1/responses"),
+            };
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "route {requested_model} forwards an {provider} login; call it through {expected_endpoint}",
+                ),
+                "invalid_request_error",
+                "invalid_request_error",
+            ));
+        }
+        if !caller_auth.has_credential(metadata.http_headers.as_ref()) {
+            let header = match caller_auth {
+                CallerAuthKind::Anthropic => "Authorization or X-Api-Key",
+                CallerAuthKind::OpenAi => "Authorization: Bearer <token>",
+            };
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                format!(
+                    "route {requested_model} requires caller-provided authentication ({header})"
+                ),
+                "authentication_error",
+                "missing_external_auth",
+            ));
+        }
     }
     let request = Request {
         llm_request,
@@ -977,8 +1005,16 @@ async fn handle_llm_request(
     };
     // Label the bandit's token bucket from the request's estimated size, so both the
     // served call and any failed answer call log the same arm context.
-    let routing_log_context = routing_log_context
-        .map(|context| context.with_estimated_tokens(estimate_input_tokens(&request)));
+    let route_id = request
+        .llm_request
+        .model
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let routing_log_context = routing_log_context.map(|context| {
+        context
+            .with_route_id(route_id)
+            .with_estimated_tokens(estimate_input_tokens(&request))
+    });
     let algorithm = Arc::clone(&route.algorithm);
     let client_router = route.target_clients.clone();
     let observer = stats_observer(
@@ -1450,12 +1486,9 @@ fn error_response(
 }
 
 async fn models(State(state): State<ServerState>) -> Json<Value> {
-    Json(model_list_payload(
-        state
-            .routes
-            .iter()
-            .map(|(model, entry)| (model.as_str(), entry.capabilities)),
-    ))
+    Json(model_list_payload(state.routes.iter().map(
+        |(model, entry)| (model.as_str(), entry.capabilities, entry.caller_auth),
+    )))
 }
 
 async fn get_stats(State(state): State<ServerState>) -> Json<StatsSnapshot> {
@@ -1536,19 +1569,22 @@ async fn not_found() -> Response {
 }
 
 fn model_list_payload<'a>(
-    entries: impl IntoIterator<Item = (&'a str, ModelCapabilities)>,
+    entries: impl IntoIterator<Item = (&'a str, ModelCapabilities, Option<CallerAuthKind>)>,
 ) -> Value {
     let entries = entries.into_iter().collect::<Vec<_>>();
-    let model_ids = entries.iter().map(|(model, _)| *model).collect::<Vec<_>>();
+    let model_ids = entries
+        .iter()
+        .map(|(model, _, _)| *model)
+        .collect::<Vec<_>>();
     let first_id = model_ids.first().copied();
     let last_id = model_ids.last().copied();
     json!({
         "object": "list",
-        "data": entries.iter().map(|(model, caps)| model_entry_json(model, *caps)).collect::<Vec<_>>(),
+        "data": entries.iter().map(|(model, caps, auth)| model_entry_json(model, *caps, *auth)).collect::<Vec<_>>(),
         "models": entries
             .iter()
             .enumerate()
-            .map(|(priority, (model, caps))| codex_model_entry_json(model, *caps, priority))
+            .map(|(priority, (model, caps, auth))| codex_model_entry_json(model, *caps, priority, *auth))
             .collect::<Vec<_>>(),
         "first_id": first_id,
         "last_id": last_id,
@@ -1558,7 +1594,11 @@ fn model_list_payload<'a>(
     })
 }
 
-fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
+fn model_entry_json(
+    model: &str,
+    capabilities: ModelCapabilities,
+    caller_auth: Option<CallerAuthKind>,
+) -> Value {
     json!({
         "id": model,
         "object": "model",
@@ -1566,6 +1606,8 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
         "created": 0,
         "owned_by": "switchyard",
         "display_name": model,
+        "requires_external_auth": caller_auth.is_some(),
+        "external_auth_kind": caller_auth.map(CallerAuthKind::as_str),
         "capabilities": {
             "streaming": true,
             "tool_calling": capabilities.tool_calling,
@@ -1598,7 +1640,12 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
 // supported_parameters — and fall back to the route's declared value. Some backends
 // publish nothing (the NVIDIA gateway returns id-only models and blocks /model/info),
 // so keep failing closed to config.
-fn codex_model_entry_json(model: &str, capabilities: ModelCapabilities, priority: usize) -> Value {
+fn codex_model_entry_json(
+    model: &str,
+    capabilities: ModelCapabilities,
+    priority: usize,
+    caller_auth: Option<CallerAuthKind>,
+) -> Value {
     // Codex is non-functional without shell and apply_patch, so an undeclared tool
     // capability defaults to enabled here; the OpenAI `data` entry reports the raw
     // Option separately for clients that want the undeclared state.
@@ -1608,6 +1655,8 @@ fn codex_model_entry_json(model: &str, capabilities: ModelCapabilities, priority
         "slug": model,
         "display_name": model,
         "description": "Switchyard-routed model.",
+        "requires_external_auth": caller_auth.is_some(),
+        "external_auth_kind": caller_auth.map(CallerAuthKind::as_str),
         "default_reasoning_level": if reasoning { json!("xhigh") } else { Value::Null },
         "supported_reasoning_levels": if reasoning { reasoning_levels() } else { json!([]) },
         "shell_type": if tool_calling { "shell_command" } else { "disabled" },

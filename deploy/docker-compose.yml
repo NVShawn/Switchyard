@@ -20,8 +20,6 @@ services:
     image: switchyard-server:local
     container_name: switchyard
     restart: unless-stopped
-    environment:
-      - NVIDIA_API_KEY=${NVIDIA_API_KEY:?export NVIDIA_API_KEY}
     ports:
       - "4000:4000"
     volumes:
@@ -34,6 +32,8 @@ services:
       - 0.0.0.0
       - --routing-log-file
       - /data/routing.jsonl
+      - --transcript-log-file
+      - /data/routing.transcript.jsonl
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/4000"]
       interval: 15s

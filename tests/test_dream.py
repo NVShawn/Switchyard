@@ -172,6 +172,49 @@ def test_dream_cli_exposes_transcript_mining_flags(tmp_path: Path) -> None:
     assert args.emit_tools is True
 
 
+def test_dream_without_ui_does_not_start_server(tmp_path: Path, monkeypatch) -> None:
+    from switchyard import dream
+
+    log = tmp_path / "routing.jsonl"
+    log.write_text("")
+    args = _build_parser().parse_args(["dream", "--log", str(log), "--out", str(tmp_path / "out.jsonl")])
+
+    served = False
+
+    def _fail_serve(**_kwargs: object) -> int:
+        nonlocal served
+        served = True
+        return 0
+
+    monkeypatch.setattr("switchyard.cli.dream_ui.serve_dream_ui", _fail_serve)
+    dream.cmd_dream_ui(args)
+    assert served is False
+
+
+def test_dream_with_ui_starts_server(tmp_path: Path, monkeypatch) -> None:
+    from switchyard import dream
+
+    log = tmp_path / "routing.jsonl"
+    log.write_text("")
+    args = _build_parser().parse_args(
+        ["dream", "--log", str(log), "--out", str(tmp_path / "out.jsonl"), "--ui"]
+    )
+
+    calls = {}
+
+    def _capture_serve(**kwargs: object) -> int:
+        calls.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("switchyard.cli.dream_ui.serve_dream_ui", _capture_serve)
+    try:
+        dream.cmd_dream_ui(args)
+    except SystemExit:
+        pass
+    assert calls["host"] == "127.0.0.1"
+    assert calls["port"] == 8008
+
+
 def test_infer_transcript_path_matches_server_naming(tmp_path: Path) -> None:
     assert infer_transcript_path(tmp_path / "routing.jsonl") == (
         tmp_path / "routing.transcript.jsonl"

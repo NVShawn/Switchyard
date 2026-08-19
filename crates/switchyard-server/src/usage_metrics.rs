@@ -46,7 +46,7 @@ pub(crate) fn observe(
             record_terminal(&stats, &agg.usage, &model, started, cache_eligible);
             if let Some((log, context)) = routing_log {
                 let latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
-                let cost_usd = cost.and_then(|cost| cost.estimate_usd(&agg.usage));
+                let cost_usd = resolve_cost(&agg.usage, cost);
                 log.append(
                     context,
                     &model,
@@ -97,7 +97,7 @@ pub(crate) fn observe(
                 let usage = latest_usage.unwrap_or_default();
                 if let Some((log, context)) = routing_log {
                     let latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
-                    let cost_usd = cost.and_then(|cost| cost.estimate_usd(&usage));
+                    let cost_usd = resolve_cost(&usage, cost);
                     let success = !stream_failed;
                     log.append(
                         context,
@@ -136,6 +136,18 @@ fn record_stream_error(stats: &StatsAccumulator, model: &str) {
         .u64_counter("switchyard.errors")
         .build()
         .add(1, &attributes(model));
+}
+
+// Prefers the upstream-reported exact cost over a per-token estimate.
+//
+// The LLM client stamps the provider's own cost (for example the LiteLLM
+// `x-litellm-response-cost` header) onto usage. When present it is authoritative
+// and avoids guessing per-token rates; otherwise we fall back to the configured
+// `TargetCost` estimate.
+fn resolve_cost(usage: &Usage, cost: Option<TargetCost>) -> Option<f64> {
+    usage
+        .reported_cost_usd()
+        .or_else(|| cost.and_then(|cost| cost.estimate_usd(usage)))
 }
 
 pub(crate) fn token_usage(usage: &Usage) -> TokenUsage {

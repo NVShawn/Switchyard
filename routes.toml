@@ -3,7 +3,7 @@ schema_version = 1
 [llm_clients.nvidia]
 format = "openai_chat"
 base_url = "https://inference-api.nvidia.com/v1"
-api_key_env = "NVIDIA_API_KEY"
+forward_auth = true
 
 
 [targets.gpt_strong]
