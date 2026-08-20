@@ -677,6 +677,9 @@ async fn affinity_keeps_the_algorithm_selection_after_client_fallback()
         judge_target: "affinity-fallback-judge".into(),
         efficient_target: "affinity-fallback-weak".into(),
         capable_target: "affinity-fallback-strong".into(),
+        capability_targets: Vec::new(),
+        capability_zones: None,
+        bandit: None,
         config: TaskClassifierConfig {
             base_threshold: 0.5,
             session_affinity: true,

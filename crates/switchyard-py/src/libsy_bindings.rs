@@ -191,6 +191,9 @@ impl PyLlmClassifierConfig {
                 judge_target: ModelId::new(judge_target),
                 efficient_target: ModelId::new(efficient_target),
                 capable_target: ModelId::new(capable_target),
+                capability_targets: Vec::new(),
+                capability_zones: None,
+                bandit: None,
                 config: config.bind(py).try_borrow()?.clone_core(),
             },
         })

@@ -22,6 +22,7 @@ use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -596,6 +597,7 @@ fn stats_observer(
     classifier_log: Option<(SharedRoutingLog, routing_log::RoutingLogContext)>,
     costs: Arc<BTreeMap<ModelId, TargetCost>>,
 ) -> RunObserver {
+    let saw_answer_call = AtomicBool::new(false);
     Arc::new(move |observation| match observation {
         RunObservation::LlmCall(call) => {
             let latency_ms = call.duration.as_secs_f64() * 1_000.0;
@@ -603,30 +605,7 @@ fn stats_observer(
                 .usage
                 .as_ref()
                 .and_then(|usage| costs.get(&call.selected_model)?.estimate_usd(usage));
-            if call.is_answer_call {
-                if call.is_success {
-                    stats.record_success(&call.selected_model, latency_ms);
-                } else {
-                    stats.record_error(&call.selected_model);
-                    if let Some((log, context)) = classifier_log.as_ref() {
-                        log.append(
-                            context.clone(),
-                            call.selected_model.as_str(),
-                            None,
-                            call.usage.as_ref(),
-                            routing_log::Outcome {
-                                cost_usd,
-                                latency_ms: Some(latency_ms),
-                                success: false,
-                                reward: Some(routing_log::compute_reward(
-                                    cost_usd, latency_ms, false,
-                                )),
-                            },
-                            routing_log::JudgeVerdict::default(),
-                        );
-                    }
-                }
-            } else if call.is_success {
+            if call.is_success {
                 if let Some((log, context)) = classifier_log.as_ref() {
                     log.append(
                         context.clone(),
@@ -652,8 +631,38 @@ fn stats_observer(
                 stats.record_classifier_error(call.selected_model);
             }
         }
+        RunObservation::AnswerCall(call) => {
+            saw_answer_call.store(call.is_success, Ordering::Relaxed);
+            let latency_ms = call.duration.as_secs_f64() * 1_000.0;
+            if call.is_success {
+                stats.record_success(&call.selected_model, latency_ms);
+            } else {
+                stats.record_error(&call.selected_model);
+                if let Some((log, context)) = classifier_log.as_ref() {
+                    let cost_usd = call
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| costs.get(&call.selected_model)?.estimate_usd(usage));
+                    log.append(
+                        context.clone(),
+                        call.selected_model.as_str(),
+                        None,
+                        call.usage.as_ref(),
+                        routing_log::Outcome {
+                            cost_usd,
+                            latency_ms: Some(latency_ms),
+                            success: false,
+                            reward: Some(routing_log::compute_reward(cost_usd, latency_ms, false)),
+                        },
+                        routing_log::JudgeVerdict::default(),
+                    );
+                }
+            }
+        }
         RunObservation::RoutingOverhead(duration) => {
-            stats.record_routing_overhead(duration.as_secs_f64() * 1_000.0);
+            if saw_answer_call.load(Ordering::Relaxed) {
+                stats.record_routing_overhead(duration.as_secs_f64() * 1_000.0);
+            }
         }
     })
 }
@@ -1016,13 +1025,12 @@ async fn handle_llm_request(
                 return algorithm_error(error);
             }
         };
-    let decision = trace.last();
     // The response carries the candidate that actually served it. Fall back to the routing
     // decision for algorithms that return a response without an offloaded model call.
     let served_model = response
         .served_model()
         .cloned()
-        .or_else(|| decision.map(|decision| decision.selected_model_id().clone()));
+        .or_else(|| Some(trace.clone()));
     let response = if let Some(served_model) = served_model.as_ref() {
         let cache_eligible = cache_probe
             .as_ref()
@@ -1305,7 +1313,7 @@ fn client_error(error: &LlmClientError) -> Response {
             "context_length_exceeded",
         ),
         LlmClientError::UpstreamHttp { status, body } => error_response(
-            StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
+            *status,
             upstream_error_message(body),
             "upstream_error",
             "upstream_error",
@@ -1769,21 +1777,18 @@ mod tests {
             Arc::new(BTreeMap::new()),
         );
 
-        let call = |model: &str, is_answer_call: bool| {
-            RunObservation::LlmCall(LlmCallObservation {
-                selected_model: ModelId::from(model),
-                is_answer_call,
-                is_success: true,
-                duration: Duration::from_millis(3),
-                usage: Some(Usage {
-                    input_tokens: Some(100),
-                    output_tokens: Some(7),
-                    ..Usage::default()
-                }),
-            })
+        let call = |model: &str| LlmCallObservation {
+            selected_model: ModelId::from(model),
+            is_success: true,
+            duration: Duration::from_millis(3),
+            usage: Some(Usage {
+                input_tokens: Some(100),
+                output_tokens: Some(7),
+                ..Usage::default()
+            }),
         };
-        observer(call("judge-model", false));
-        observer(call("routed-model", true));
+        observer(RunObservation::LlmCall(call("judge-model")));
+        observer(RunObservation::AnswerCall(call("routed-model")));
 
         let snapshot = log
             .snapshot_session("session-1")

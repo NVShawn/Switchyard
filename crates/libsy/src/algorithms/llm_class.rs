@@ -701,6 +701,7 @@ enum Zone {
 ///
 /// The bandit never replaces the judge: it only shifts `p_solve` before zone
 /// classification, so removing it is a config flip, not a refactor.
+#[derive(Clone)]
 pub struct BanditConfig {
     /// Shared bandit state over `(target, token bucket)` arms.
     pub sampler: Arc<ThompsonSampler>,
@@ -843,7 +844,7 @@ impl CostAwareClassifier {
         let results = futures::future::join_all(
             candidates
                 .iter()
-                .map(|rung| driver.call_model(request.clone(), vec![rung.target.clone()], true)),
+                .map(|rung| driver.call_model(request.clone(), vec![rung.target.clone()])),
         )
         .await;
 
@@ -889,11 +890,7 @@ impl CostAwareClassifier {
             .collect();
         let compare_request = Self::compare_request(request, &candidate_texts, zones);
         let winner = match driver
-            .call_model(
-                compare_request,
-                vec![zones.output_judge_target.clone()],
-                false,
-            )
+            .call_model(compare_request, vec![zones.output_judge_target.clone()])
             .await
         {
             Ok(response) => match response.llm_response.into_agg().await {
