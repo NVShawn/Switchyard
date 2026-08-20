@@ -133,6 +133,61 @@ def test_summary_aggregates_routing_and_mining_metrics(tmp_path):
     assert summary["mining"]["top"][0]["excess"] == 1
 
 
+def test_trends_endpoint_aggregates_selector_attribution(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from switchyard.cli.dream_ui import build_app
+
+    bundle = _bundle(tmp_path)
+    records = [
+        {"ts": "2026-01-01T01:15:00Z", "route_id": "auto", "model": "nano"},
+        {"ts": "2026-01-01T01:45:00Z", "route_id": "auto", "model": "nano"},
+        {"ts": "2026-01-01T02:00:00Z", "route_id": "auto", "model": "large"},
+        {
+            "ts": "2026-01-01T02:00:00Z",
+            "route_id": "auto",
+            "model": "judge",
+            "tier": "classifier",
+        },
+    ]
+    (bundle / "routing.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records)
+    )
+
+    client = TestClient(build_app(root=tmp_path))
+    response = client.get("/api/trends?period=hourly")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "period": "hourly",
+        "points": [
+            {
+                "start": "2026-01-01T01:00:00Z",
+                "calls": 2,
+                "routes": [
+                    {
+                        "route_id": "auto",
+                        "calls": 2,
+                        "targets": [{"target": "nano", "calls": 2, "share": 1.0}],
+                    }
+                ],
+            },
+            {
+                "start": "2026-01-01T02:00:00Z",
+                "calls": 1,
+                "routes": [
+                    {
+                        "route_id": "auto",
+                        "calls": 1,
+                        "targets": [{"target": "large", "calls": 1, "share": 1.0}],
+                    }
+                ],
+            },
+        ],
+    }
+    assert client.get("/api/trends?period=monthly").status_code == 422
+
+
 def test_summary_endpoint_and_dashboard_render(tmp_path):
     from fastapi.testclient import TestClient
 
@@ -153,7 +208,7 @@ def test_summary_endpoint_and_dashboard_render(tmp_path):
     assert "Routing Observatory" in page.text
     assert "Arm performance" in page.text
     assert "Cost / latency frontier" in page.text
-    assert "Custom selector decisions" in page.text
+    assert "Selector attribution trends" in page.text
     assert "Judge calibration" in page.text
     assert "custom target selectors do not emit probabilities" in page.text
     assert "Tool-call churn opportunities" in page.text
