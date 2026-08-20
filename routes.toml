@@ -62,6 +62,81 @@ id = "nvidia/nvidia/nemotron-3.5-lightning"
 llm_client = "nvidia"
 cost = { input_per_1m = 0.15, output_per_1m = 0.6 }
 
+[targets.llama_8b]
+id = "nvidia/meta/llama-3.1-8b-instruct"
+llm_client = "nvidia"
+cost = { input_per_1m = 0.35, output_per_1m = 1.4 }
+
+[targets.llama_70b]
+id = "nvidia/meta/llama-3.1-70b-instruct"
+llm_client = "nvidia"
+cost = { input_per_1m = 3.5, output_per_1m = 14.0 }
+
+[targets.llama_vision_11b]
+id = "nvidia/meta/llama-3.2-11b-vision-instruct"
+llm_client = "nvidia"
+cost = { input_per_1m = 0.6, output_per_1m = 2.4 }
+
+[targets.mixtral_8x22b]
+id = "nvidia/mistralai/mixtral-8x22b-instruct-v01"
+llm_client = "nvidia"
+cost = { input_per_1m = 3.0, output_per_1m = 12.0 }
+
+[targets.qwen_32b]
+id = "nvidia/qwen/qwen3-32b"
+llm_client = "nvidia"
+cost = { input_per_1m = 1.2, output_per_1m = 4.8 }
+
+[targets.qwen_235b]
+id = "nvidia/qwen/qwen-235b"
+llm_client = "nvidia"
+cost = { input_per_1m = 4.0, output_per_1m = 16.0 }
+
+[targets.qwen_5_9b]
+id = "nvidia/qwen/qwen3.5-9b"
+llm_client = "nvidia"
+cost = { input_per_1m = 0.45, output_per_1m = 1.8 }
+
+[targets.nemotron_eval_30b]
+id = "nvidia/nvidia/evals-nemotron-3-30b-a3b"
+llm_client = "nvidia"
+cost = { input_per_1m = 1.0, output_per_1m = 4.0 }
+
+[targets.nemotron_eval_nano]
+id = "nvidia/nvidia/evals-nemotron-3-nano"
+llm_client = "nvidia"
+cost = { input_per_1m = 0.25, output_per_1m = 1.0 }
+
+[targets.gpt_oss_20b]
+id = "nvidia/openai/gpt-oss-20b"
+llm_client = "nvidia"
+cost = { input_per_1m = 1.0, output_per_1m = 4.0 }
+
+[targets.gpt_oss_120b]
+id = "nvidia/openai/gpt-oss-120b"
+llm_client = "nvidia"
+cost = { input_per_1m = 3.5, output_per_1m = 14.0 }
+
+[targets.gemma_2_9b]
+id = "nvidia/google/gemma-2-9b-it"
+llm_client = "nvidia"
+cost = { input_per_1m = 0.3, output_per_1m = 1.2 }
+
+[targets.gemma_4_31b]
+id = "nvidia/google/gemma-4-31b-it"
+llm_client = "nvidia"
+cost = { input_per_1m = 1.4, output_per_1m = 5.6 }
+
+[targets.kimi_k3]
+id = "nvidia/moonshotai/kimi-k3"
+llm_client = "nvidia"
+cost = { input_per_1m = 2.0, output_per_1m = 8.0 }
+
+[targets.deepseek_flash]
+id = "nvidia/deepseek-ai/deepseek-v4-flash"
+llm_client = "nvidia"
+cost = { input_per_1m = 0.5, output_per_1m = 2.0 }
+
 
 [routes.gpt_only]
 id = "gpt_only"
@@ -155,7 +230,7 @@ id = "auto"
 type = "llm_classifier"
 mode = "custom"
 classifier_target = "claude_opus"
-targets = ["gpt_strong", "claude_opus", "claude_sonnet", "gpt_nano", "nemotron_nano", "nemotron_ultra", "gpt_sol", "kimi_max", "deepseek_pro", "glm_strong", "nemotron_lightning"]
+targets = ["gpt_strong", "claude_opus", "claude_sonnet", "gpt_nano", "nemotron_nano", "nemotron_ultra", "gpt_sol", "kimi_max", "deepseek_pro", "glm_strong", "nemotron_lightning", "llama_8b", "llama_70b", "llama_vision_11b", "mixtral_8x22b", "qwen_32b", "qwen_235b", "qwen_5_9b", "nemotron_eval_30b", "nemotron_eval_nano", "gpt_oss_20b", "gpt_oss_120b", "gemma_2_9b", "gemma_4_31b", "kimi_k3", "deepseek_flash"]
 default_target = "claude_opus"
 session_affinity = true
 prompt = """
@@ -184,7 +259,7 @@ Select the backend best suited to the request.
 - nemotron_lightning (nvidia/nvidia/nemotron-3.5-lightning): fastest and cheapest Nemotron; use for simple, high-throughput tasks where latency and cost are paramount.
 
 Respond with only a JSON object of the exact form {"decision": {"target": "<name>"}},
-where <name> is one of: gpt_strong, claude_opus, claude_sonnet, gpt_nano, nemotron_nano, nemotron_ultra, gpt_sol, kimi_max, deepseek_pro, glm_strong, nemotron_lightning.
+where <name> is one of: gpt_strong, claude_opus, claude_sonnet, gpt_nano, nemotron_nano, nemotron_ultra, gpt_sol, kimi_max, deepseek_pro, glm_strong, nemotron_lightning, llama_8b, llama_70b, llama_vision_11b, mixtral_8x22b, qwen_32b, qwen_235b, qwen_5_9b, nemotron_eval_30b, nemotron_eval_nano, gpt_oss_20b, gpt_oss_120b, gemma_2_9b, gemma_4_31b, kimi_k3, deepseek_flash.
 Add no other keys and no text outside the JSON object.
 """
 
@@ -197,7 +272,7 @@ response_schema = '''
       "properties": {
         "target": {
           "type": "string",
-          "enum": ["gpt_strong", "claude_opus", "claude_sonnet", "gpt_nano", "nemotron_nano", "nemotron_ultra", "gpt_sol", "kimi_max", "deepseek_pro", "glm_strong", "nemotron_lightning"]
+          "enum": ["gpt_strong", "claude_opus", "claude_sonnet", "gpt_nano", "nemotron_nano", "nemotron_ultra", "gpt_sol", "kimi_max", "deepseek_pro", "glm_strong", "nemotron_lightning", "llama_8b", "llama_70b", "llama_vision_11b", "mixtral_8x22b", "qwen_32b", "qwen_235b", "qwen_5_9b", "nemotron_eval_30b", "nemotron_eval_nano", "gpt_oss_20b", "gpt_oss_120b", "gemma_2_9b", "gemma_4_31b", "kimi_k3", "deepseek_flash"]
         }
       },
       "required": ["target"],
