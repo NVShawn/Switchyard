@@ -22,7 +22,7 @@ use super::util::llm_judge::{
     ClassifierInput, JsonSchemaDecoder, JudgeClassifier, JudgePolicy, JudgeRuntimeConfig,
     SerdeDecoder, StructuredJudge,
 };
-use super::util::target_selector::TargetSelectorPolicy;
+use super::util::target_selector::{LearnedTargetStat, TargetSelectorPolicy};
 use super::util::thompson::{ThompsonSampler, estimate_request_tokens, token_bucket};
 use crate::core::algorithm::{self, Algorithm, Driver};
 use crate::core::classifier::{Classification, Classifier, Score};
@@ -502,9 +502,15 @@ impl TaskClassifierConfig {
 #[derive(Clone, Debug)]
 pub enum CustomClassifierPolicy {
     /// Resolves a JSON Pointer and treats its string value as a configured target label.
+    ///
+    /// When `learned` is non-empty, the verdict is fully replaced by the label with the
+    /// highest observed posterior-mean reward — a deterministic, exploration-free pick.
     TargetSelector {
         /// JSON Pointer evaluated against each schema-validated verdict.
         selector: String,
+        /// Learned per-label reward stats, keyed by target label. Empty keeps the
+        /// verdict-driven behavior.
+        learned: BTreeMap<String, LearnedTargetStat>,
     },
 }
 
@@ -513,6 +519,19 @@ impl CustomClassifierPolicy {
     pub fn target_selector(selector: impl Into<String>) -> Self {
         Self::TargetSelector {
             selector: selector.into(),
+            learned: BTreeMap::new(),
+        }
+    }
+
+    /// Creates a target-selector policy with learned per-label reward stats attached,
+    /// switching selection to the deterministic best-observed-target replacement.
+    pub fn learned_target_selector(
+        selector: impl Into<String>,
+        learned: BTreeMap<String, LearnedTargetStat>,
+    ) -> Self {
+        Self::TargetSelector {
+            selector: selector.into(),
+            learned,
         }
     }
 }
@@ -1418,10 +1437,10 @@ impl LlmTaskClassifier {
         } = config;
         let contract = ClassifierContract::from_inner_schema(&prompt, response_schema)?;
         let policy = match policy {
-            CustomClassifierPolicy::TargetSelector { selector } => {
-                CustomPolicyRuntime::TargetSelector(TargetSelectorPolicy::new(
-                    selector, target_map,
-                )?)
+            CustomClassifierPolicy::TargetSelector { selector, learned } => {
+                CustomPolicyRuntime::TargetSelector(
+                    TargetSelectorPolicy::new(selector, target_map)?.with_learned(learned),
+                )
             }
         };
         let classifier: Arc<dyn Classifier<State>> = Arc::new(JudgeClassifier::new(
