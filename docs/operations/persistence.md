@@ -69,19 +69,92 @@ uv run switchyard dream --log deploy/data/routing.jsonl \
   --base-url https://inference-api.nvidia.com/v1
 ```
 
+### Emit learned target selection
+
+A custom classifier route can replace each judge verdict with the target that
+has the highest learned mean reward. Map each route target label to the model ID
+stored in `routing.jsonl`, then emit the weights file:
+
+```bash
+uv run switchyard dream --log /data/routing.jsonl \
+  --emit-weights /data/learned_weights.toml \
+  --label-map weak=model/weak \
+  --label-map premium=model/premium
+```
+
+Configure the server with the emitted file:
+
+```toml
+schema_version = 1
+
+[llm_clients.upstream]
+format = "openai_chat"
+base_url = "https://provider.example/v1"
+api_key_env = "PROVIDER_API_KEY"
+
+[targets.classifier]
+id = "model/classifier"
+llm_client = "upstream"
+
+[targets.weak]
+id = "model/weak"
+llm_client = "upstream"
+
+[targets.premium]
+id = "model/premium"
+llm_client = "upstream"
+
+[routes.auto]
+id = "switchyard/auto"
+type = "llm_classifier"
+mode = "custom"
+classifier_target = "classifier"
+targets = ["weak", "premium"]
+default_target = "premium"
+prompt = "Select the best target."
+response_schema = '''
+{
+  "type": "object",
+  "properties": {
+    "decision": {
+      "type": "object",
+      "properties": {
+        "target": {"type": "string", "enum": ["weak", "premium"]}
+      },
+      "required": ["target"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["decision"],
+  "additionalProperties": false
+}
+'''
+
+[routes.auto.policy]
+type = "target_selector"
+selector = "/decision/target"
+
+[routes.auto.learned_selection]
+weights_path = "/data/learned_weights.toml"
+```
+
+`learned_selection` is accepted only by an `llm_classifier` with `mode =
+"custom"` and a `target_selector` policy. The route name `auto` has no special
+parsing: it is a normal key under `[routes]`, while `id` is the model clients
+request. Restart or reload the server after replacing the weights file because
+it is read when the route is built.
+
 ### Picking up post-dream data without a restart
 
 The serving process has no restart requirement to see a growing log:
 
 - Bandit-enabled routes re-aggregate arm priors from the log on a five-minute
   interval, with the first pass on startup. Records appended to the shared file
-  (new traffic, or a log the dream step was analyzing) feed the sampler without
-  a restart.
+  feed the sampler without a restart.
 - Per-session stats (`GET /v1/routing/session-stats`) rescan the log on demand.
 
-Dream itself is read-only on the log. Its `--out` label file is for offline
-fine-tuning, not something the serving process ingests; changing routing
-behavior from dream output is not part of the current feature surface.
+The `--out` label file remains an offline fine-tuning artifact. Unlike the
+bandit log, a learned-selection weights file is loaded only at server startup.
 
 ## Related Documentation
 

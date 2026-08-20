@@ -438,6 +438,83 @@ enum ClassifierMode {
     Custom,
 }
 
+/// Learned target selection for a custom `target_selector` route
+/// (`[routes.<name>.learned_selection]`).
+///
+/// Points at a TOML weights file the offline dream updater produces. Presence
+/// auto-enables deterministic full replacement of the judge's verdict: the target
+/// with the highest observed posterior-mean reward is selected immediately, with no
+/// exploration. Only valid on a custom classifier route with a `target_selector` policy.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LearnedSelectionConfigToml {
+    /// Path to the learned per-target weights TOML file.
+    weights_path: String,
+}
+
+/// One learned per-target reward stat, as stored in the weights file's `[[target]]`
+/// array. `alpha`/`beta` are the target's Beta posterior parameters.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LearnedTargetStatToml {
+    /// Configured target label this stat applies to.
+    label: String,
+    /// Beta prior alpha: soft success count plus one.
+    alpha: f64,
+    /// Beta prior beta: soft failure count plus one.
+    beta: f64,
+}
+
+/// The parsed learned-weights file: a flat array of per-target stats.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LearnedWeightsFile {
+    #[serde(default)]
+    target: Vec<LearnedTargetStatToml>,
+}
+
+/// Reads and validates a learned-weights TOML file into a label → stat map.
+///
+/// Rejects non-finite or non-positive Beta parameters so a corrupt file cannot
+/// silently skew selection. An empty file yields an empty map, which keeps the
+/// verdict-driven behavior.
+fn load_learned_weights(
+    route_name: &str,
+    path: &str,
+) -> ServerResult<BTreeMap<String, libsy::LearnedTargetStat>> {
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        ServerError::new(format!(
+            "llm_classifier route {route_name} learned_selection weights_path {path}: {error}"
+        ))
+    })?;
+    let parsed: LearnedWeightsFile = toml::from_str(&contents).map_err(|error| {
+        ServerError::new(format!(
+            "llm_classifier route {route_name} learned_selection weights_path {path} is invalid TOML: {error}"
+        ))
+    })?;
+    let mut learned = BTreeMap::new();
+    for stat in parsed.target {
+        if !stat.alpha.is_finite()
+            || stat.alpha <= 0.0
+            || !stat.beta.is_finite()
+            || stat.beta <= 0.0
+        {
+            return Err(ServerError::new(format!(
+                "llm_classifier route {route_name} learned_selection target {:?} alpha and beta must be positive finite numbers",
+                stat.label
+            )));
+        }
+        learned.insert(
+            stat.label,
+            libsy::LearnedTargetStat {
+                alpha: stat.alpha,
+                beta: stat.beta,
+            },
+        );
+    }
+    Ok(learned)
+}
+
 impl ClassifierPolicyConfig {
     fn into_libsy(self) -> CustomClassifierPolicy {
         match self {
@@ -494,6 +571,8 @@ struct CustomClassifierRouteConfig {
     message_hash_fallback: bool,
     recent_turn_window: Option<usize>,
     max_output_tokens: u64,
+    /// Learned target selection, when a weights file is configured.
+    learned_selection: Option<LearnedSelectionConfigToml>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -580,6 +659,9 @@ enum RouteConfig {
         /// Thompson-sampling confidence correction, refreshed from the routing log.
         #[serde(default)]
         bandit: Option<BanditConfigToml>,
+        /// Learned deterministic target selection for a custom `target_selector` route.
+        #[serde(default)]
+        learned_selection: Option<LearnedSelectionConfigToml>,
     },
     StageRouter {
         id: ModelId,
@@ -794,6 +876,7 @@ impl RouteConfig {
             capability_targets,
             zones,
             bandit,
+            learned_selection,
             ..
         } = self
         else {
@@ -822,6 +905,7 @@ impl RouteConfig {
                     default_target,
                     response_schema,
                     policy,
+                    learned_selection,
                 )?;
                 let capability_targets = capability_targets.clone().unwrap_or_default();
                 for rung in &capability_targets {
@@ -929,6 +1013,7 @@ impl RouteConfig {
                     default_target,
                     response_schema,
                     policy,
+                    learned_selection,
                 )?;
                 if capability_targets.is_some() {
                     return Err(classifier_field_error(
@@ -1007,6 +1092,7 @@ impl RouteConfig {
                         message_hash_fallback: *message_hash_fallback,
                         recent_turn_window: *recent_turn_window,
                         max_output_tokens: *max_output_tokens,
+                        learned_selection: learned_selection.clone(),
                     },
                 ))
             }
@@ -1021,11 +1107,13 @@ fn reject_custom_fields(
     default_target: &Option<String>,
     response_schema: &Option<String>,
     policy: &Option<ClassifierPolicyConfig>,
+    learned_selection: &Option<LearnedSelectionConfigToml>,
 ) -> ServerResult<()> {
     if targets.is_some()
         || default_target.is_some()
         || response_schema.is_some()
         || policy.is_some()
+        || learned_selection.is_some()
     {
         return Err(ServerError::new(format!(
             "llm_classifier route {route_name} mode {mode} cannot use custom classifier fields"
@@ -1265,10 +1353,26 @@ fn build_algorithm(
                             ))
                         },
                     )?;
+                    // Learned selection auto-enables deterministic full replacement when a
+                    // weights file is configured; without one the verdict decides.
+                    let policy = match config.learned_selection {
+                        Some(learned) => {
+                            let weights =
+                                load_learned_weights(route_name, &learned.weights_path)?;
+                            match config.policy {
+                                ClassifierPolicyConfig::TargetSelector { selector } => {
+                                    CustomClassifierPolicy::learned_target_selector(
+                                        selector, weights,
+                                    )
+                                }
+                            }
+                        }
+                        None => config.policy.into_libsy(),
+                    };
                     let mut classifier_config = CustomClassifierConfig::new(
                         config.prompt,
                         response_schema,
-                        config.policy.into_libsy(),
+                        policy,
                     );
                     classifier_config.session_affinity = config.session_affinity;
                     classifier_config.message_hash_fallback = config.message_hash_fallback;

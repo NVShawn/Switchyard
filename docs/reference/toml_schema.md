@@ -230,6 +230,18 @@ Classifier prompts must not contain `{{RESPONSE_SCHEMA}}`. Switchyard supplies
 the schema automatically: through the structured-output request in `json_schema`
 mode, or in the prompt in `json_object` mode.
 
+`[routes.<name>.learned_selection]` layers deterministic learned routing on a
+custom `target_selector` route. When present, the judge's verdict is fully
+replaced: Switchyard reads the weights file and routes every request to the
+target with the highest observed posterior-mean reward, immediately and with no
+exploration. Produce the file offline with `switchyard dream --emit-weights
+weights.toml --label-map <target>=<logged-model-id>`; it holds one `[[target]]` entry per
+label with `alpha`/`beta` Beta parameters.
+
+| Key | Required | Default | Meaning |
+|---|:---:|---|---|
+| `weights_path` | Yes | — | Path to the learned per-target weights TOML file. Each `[[target]]` needs `label`, `alpha`, and `beta`, all positive finite. |
+
 ### `stage_router`
 
 Scores tool signals to pick a tier per turn. See

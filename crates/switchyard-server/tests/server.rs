@@ -1178,6 +1178,115 @@ selector = "/decision/target"
 }
 
 #[tokio::test]
+async fn learned_selection_overrides_the_verdict_with_the_best_observed_target() -> TestResult {
+    // The judge verdict names "premium", but a learned-weights file shows "weak"
+    // outperforming every other target. Learned selection is deterministic full
+    // replacement, so the route serves "weak" regardless of the verdict.
+    let upstream = MockUpstream::start().await?;
+    let mut weights = tempfile::Builder::new()
+        .prefix("switchyard-learned-weights-")
+        .suffix(".toml")
+        .tempfile()?;
+    weights.write_all(
+        br#"
+[[target]]
+label = "weak"
+alpha = 19.0
+beta = 1.0
+
+[[target]]
+label = "premium"
+alpha = 2.0
+beta = 8.0
+"#,
+    )?;
+    weights.flush()?;
+    let weights_path = weights.path().display().to_string();
+
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.upstream]
+format = "openai_chat"
+base_url = "{base_url}"
+
+[targets.classifier]
+id = "model/classifier"
+llm_client = "upstream"
+
+[targets.weak]
+id = "model/weak"
+llm_client = "upstream"
+
+[targets.strong]
+id = "model/strong"
+llm_client = "upstream"
+
+[targets.premium]
+id = "model/premium"
+llm_client = "upstream"
+
+[routes.custom]
+id = "switchyard/custom"
+type = "llm_classifier"
+mode = "custom"
+classifier_target = "classifier"
+targets = ["weak", "strong", "premium"]
+default_target = "strong"
+prompt = "CUSTOM MULTI TARGET"
+response_schema = '''
+{{
+  "type": "object",
+  "properties": {{
+    "decision": {{
+      "type": "object",
+      "properties": {{
+        "target": {{"type": "string", "enum": ["weak", "strong", "premium"]}}
+      }},
+      "required": ["target"],
+      "additionalProperties": false
+    }}
+  }},
+  "required": ["decision"],
+  "additionalProperties": false
+}}
+'''
+
+[routes.custom.policy]
+type = "target_selector"
+selector = "/decision/target"
+
+[routes.custom.learned_selection]
+weights_path = "{weights_path}"
+"#,
+        base_url = upstream.base_url,
+        weights_path = weights_path,
+    ))?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": "switchyard/custom",
+            "messages": [{"role": "user", "content": "route this task"}]
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(
+        response
+            .headers
+            .get("x-model-router-selected-model")
+            .and_then(|value| value.to_str().ok()),
+        Some("model/weak")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn custom_classifier_streams_prose_and_tool_calls_from_the_routed_model() -> TestResult {
     // A custom-schema classifier must relay the routed model's response untouched:
     // both the prose that accompanies a tool call and the tool call itself. This

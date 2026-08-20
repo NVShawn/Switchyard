@@ -16,6 +16,18 @@ from switchyard.cli.launch_command import (
 from switchyard.dream import cmd_dream_ui
 
 
+def _label_mapping(value: str) -> str:
+    label, separator, model = value.partition("=")
+    if not separator or not label.strip() or not model.strip():
+        raise argparse.ArgumentTypeError("expected TARGET=MODEL_ID")
+    return f"{label.strip()}={model.strip()}"
+
+
+def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if getattr(args, "label", []) and getattr(args, "emit_weights", None) is None:
+        parser.error("--label-map requires --emit-weights")
+
+
 def _add_launch_parser(
     subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
 ) -> None:
@@ -98,6 +110,28 @@ def _add_dream_parser(
         help="Emit draft tools for repeated intents (implies --mine).",
     )
     dream.add_argument(
+        "--emit-weights",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Write learned-selection TOML weights to PATH from rewarded answer calls. "
+            "Use the file on a custom llm_classifier target_selector route."
+        ),
+    )
+    dream.add_argument(
+        "--label-map",
+        "--label",
+        dest="label",
+        action="append",
+        default=[],
+        type=_label_mapping,
+        metavar="TARGET=MODEL_ID",
+        help=(
+            "Map a route target label to its logged model id for --emit-weights. "
+            "Repeatable; unmapped model ids become target labels."
+        ),
+    )
+    dream.add_argument(
         "--base-url",
         default="https://api.openai.com/v1",
         help="OpenAI-compatible base URL for the strong model.",
@@ -147,6 +181,7 @@ def main() -> None:
 
     parser = _build_parser()
     args = parser.parse_args()
+    _validate_args(parser, args)
     if not hasattr(args, "func"):
         parser.print_help()
         raise SystemExit(1)

@@ -92,8 +92,16 @@ task header through an OpenAI-compatible model and writes fine-tune labels.
 
 ```bash
 switchyard dream --log routing.jsonl [--out labels.jsonl] \
-  [--strong-model <model>] [--base-url <url>] [--api-key <key>]
+  [--strong-model <model>] [--base-url <url>] [--api-key <key>] \
+  [--emit-weights weights.toml] \
+  [--label-map <target>=<logged-model-id>]...
 ```
+
+`--emit-weights` aggregates rewarded answer calls into per-target Beta
+parameters for a custom `llm_classifier` `target_selector` route. Repeat
+`--label-map` when route target labels differ from logged model IDs; it requires
+`--emit-weights`. Unmapped model IDs are emitted as target labels. The legacy
+`--label` spelling remains accepted.
 
 The strong-model re-judging uses `OPENAI_API_KEY` when `--api-key` is not given.
 

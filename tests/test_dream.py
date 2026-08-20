@@ -6,15 +6,20 @@
 import json
 from pathlib import Path
 
-from switchyard.cli.switchyard_cli import _build_parser
+import pytest
+
+from switchyard.cli.switchyard_cli import _build_parser, _validate_args
 from switchyard.dream import (
     brier_score,
     cheap_wrong_rate,
     emit_labels,
     judge_calibration,
+    learned_target_weights,
+    parse_label_map,
     read_records,
     summarize_arms,
     teacher_calibration,
+    write_learned_weights,
 )
 from switchyard.dream_mining import (
     build_mining_report,
@@ -170,6 +175,111 @@ def test_dream_cli_exposes_transcript_mining_flags(tmp_path: Path) -> None:
     assert args.mine is True
     assert args.emit_skills is True
     assert args.emit_tools is True
+
+
+def test_learned_target_weights_favor_the_higher_reward_target():
+    # weak earns high rewards, premium fails: the learned weights must rank weak first.
+    records = [
+        {"model": "model/weak", "reward": 0.9, "token_bucket": "small"},
+        {"model": "model/weak", "reward": 0.8, "token_bucket": "medium"},
+        {"model": "model/premium", "reward": 0.0, "token_bucket": "small"},
+        {"model": "model/premium", "reward": 0.0, "token_bucket": "small"},
+        # A classifier call is not an arm and must not contribute a weight.
+        {"model": "model/classifier", "tier": "classifier", "reward": 0.0, "token_bucket": "small"},
+    ]
+    model_to_label = {"model/weak": "weak", "model/premium": "premium"}
+
+    weights = learned_target_weights(records, model_to_label)
+
+    by_label = {weight.label: weight for weight in weights}
+    assert set(by_label) == {"weak", "premium"}
+    assert by_label["weak"].mean > by_label["premium"].mean
+    best = max(weights, key=lambda weight: weight.mean)
+    assert best.label == "weak"
+
+
+def test_learned_target_weights_default_label_to_model_id():
+    records = [{"model": "model/weak", "reward": 0.5, "token_bucket": "small"}]
+
+    weights = learned_target_weights(records, {})
+
+    assert [weight.label for weight in weights] == ["model/weak"]
+
+
+def test_parse_label_map_rejects_malformed_pairs():
+    assert parse_label_map(["weak=model/weak"]) == {"model/weak": "weak"}
+    for bad in ["weak", "=model", "weak="]:
+        try:
+            parse_label_map([bad])
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad!r}")
+
+
+def test_write_learned_weights_emits_target_array(tmp_path: Path):
+    from switchyard.dream import TargetWeight
+
+    out = tmp_path / "weights.toml"
+    write_learned_weights(
+        out,
+        [
+            TargetWeight("weak", alpha=19.0, beta=1.0),
+            TargetWeight("premium", alpha=2.0, beta=8.0),
+        ],
+    )
+
+    text = out.read_text()
+    assert text.count("[[target]]") == 2
+    assert 'label = "weak"' in text
+    assert "alpha = 19.0" in text
+    assert "beta = 8.0" in text
+
+
+def test_dream_cli_exposes_learned_weight_flags(tmp_path: Path) -> None:
+    args = _build_parser().parse_args(
+        [
+            "dream",
+            "--log",
+            str(tmp_path / "routing.jsonl"),
+            "--emit-weights",
+            str(tmp_path / "weights.toml"),
+            "--label-map",
+            "weak=model/weak",
+            "--label-map",
+            "premium=model/premium",
+        ]
+    )
+
+    assert args.emit_weights == tmp_path / "weights.toml"
+    assert args.label == ["weak=model/weak", "premium=model/premium"]
+
+
+def test_dream_cli_validates_label_mapping(capsys: pytest.CaptureFixture[str]) -> None:
+    parser = _build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["dream", "--log", "routing.jsonl", "--label-map", "weak"])
+    assert "expected TARGET=MODEL_ID" in capsys.readouterr().err
+
+    args = parser.parse_args(
+        ["dream", "--log", "routing.jsonl", "--label-map", "weak=model/weak"]
+    )
+    with pytest.raises(SystemExit):
+        _validate_args(parser, args)
+    assert "--label-map requires --emit-weights" in capsys.readouterr().err
+
+
+def test_dream_cli_help_describes_learned_weight_contract(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        _build_parser().parse_args(["dream", "--help"])
+
+    assert exit_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--emit-weights PATH" in help_text
+    assert "--label-map TARGET=MODEL_ID" in help_text
+    assert "llm_classifier target_selector route" in help_text
 
 
 def test_infer_transcript_path_matches_server_naming(tmp_path: Path) -> None:

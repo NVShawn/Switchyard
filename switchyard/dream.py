@@ -278,6 +278,80 @@ def teacher_calibration(labels: list[dict[str, Any]]) -> float:
     return brier_score(predictions)
 
 
+@dataclass(frozen=True)
+class TargetWeight:
+    """Learned Beta posterior for one routing target, aggregated across buckets."""
+
+    label: str
+    alpha: float
+    beta: float
+
+    @property
+    def mean(self) -> float:
+        """Posterior mean reward — the server's deterministic ranking key."""
+        return self.alpha / (self.alpha + self.beta)
+
+
+def parse_label_map(entries: list[str]) -> dict[str, str]:
+    """Parse `LABEL=MODEL` pairs into a model-id -> target-label lookup.
+
+    Raises `ValueError` on a malformed pair so a typo cannot silently drop a target.
+    """
+    model_to_label: dict[str, str] = {}
+    for entry in entries:
+        label, sep, model = entry.partition("=")
+        if not sep or not label.strip() or not model.strip():
+            raise ValueError(f"invalid --label-map {entry!r}, expected TARGET=MODEL_ID")
+        model_to_label[model.strip()] = label.strip()
+    return model_to_label
+
+
+def learned_target_weights(
+    records: list[dict[str, Any]], model_to_label: dict[str, str]
+) -> list[TargetWeight]:
+    """Aggregate answer-call rewards per target into Beta posteriors, across buckets.
+
+    Each target's `alpha` is the summed reward plus one and `beta` the failure mass plus
+    one (floored so the prior stays defined) — the same mapping the server's online
+    refresh uses. A model with no configured label maps to itself, so an unmapped route
+    still produces a usable weight. Classifier calls and reward-less records are skipped.
+    """
+    totals: dict[str, tuple[int, float]] = {}
+    for record in records:
+        reward = record.get("reward")
+        model = record.get("model")
+        if reward is None or not model:
+            continue
+        if record.get("tier") == _CLASSIFIER_TIER:
+            continue
+        label = model_to_label.get(model, model)
+        count, sum_reward = totals.get(label, (0, 0.0))
+        totals[label] = (count + 1, sum_reward + float(reward))
+    weights = []
+    for label in sorted(totals):
+        count, sum_reward = totals[label]
+        alpha = sum_reward + 1.0
+        beta = max(count - sum_reward + 1.0, 1.0)
+        weights.append(TargetWeight(label, alpha, beta))
+    return weights
+
+
+def write_learned_weights(path: Path, weights: list[TargetWeight]) -> None:
+    """Write learned per-target weights as the server's `[[target]]` TOML array.
+
+    The server reads this file through a route's `[routes.<name>.learned_selection]`
+    and selects the highest-mean target deterministically.
+    """
+    lines = []
+    for weight in weights:
+        lines.append("[[target]]")
+        lines.append(f"label = {json.dumps(weight.label)}")
+        lines.append(f"alpha = {weight.alpha!r}")
+        lines.append(f"beta = {weight.beta!r}")
+        lines.append("")
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
 def _build_run_bundle(*, log_path: Path, out_path: Path) -> Path:
     out_path = out_path.resolve()
     parent = out_path.parent
@@ -322,6 +396,16 @@ def cmd_dream(args: argparse.Namespace) -> Path:
     judged = judge_calibration(records)
     if any(r.get("judge_p_solve") is not None for r in records):
         print(f"serving-judge calibration (Brier, lower is better): {judged:.4f}")
+
+    if args.emit_weights:
+        model_to_label = parse_label_map(args.label)
+        weights = learned_target_weights(records, model_to_label)
+        write_learned_weights(args.emit_weights, weights)
+        write_learned_weights(bundle_dir / "learned_weights.toml", weights)
+        best = max(weights, key=lambda w: w.mean, default=None)
+        print(f"wrote {len(weights)} learned target weights to {args.emit_weights}")
+        if best is not None:
+            print(f"learned best target: {best.label} (mean_reward={best.mean:.3f})")
 
     mine = args.mine or args.emit_skills or args.emit_tools
     if mine:

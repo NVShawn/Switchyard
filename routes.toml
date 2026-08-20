@@ -173,57 +173,6 @@ id = "glm_strong"
 type = "passthrough"
 target = "glm_strong"
 
-[routes.auto_cheap_vs_expensive]
-id = "auto_cheap_vs_expensive"
-type = "llm_classifier"
-mode = "custom"
-classifier_target = "claude_opus"
-targets = ["gpt_strong", "claude_opus", "nemotron_nano", "nemotron_ultra"]
-default_target = "claude_opus"
-session_affinity = true
-prompt = """
-Select the backend best suited to the request.
-
-- gpt_strong: harder reasoning, above cheap but below opus; use for debugging, planning,
-  structured code work, and tasks that require careful reasoning but are not high-risk.
-
-- claude_opus: high-risk, ambiguous, or nuanced work; use for the most ambiguous,
-  high-stakes, cross-module, or uncertain tasks where mistakes are costly.
-
-- nemotron_nano: cheap tier, moderate context window (262K tokens); use for routine
-  chat, light assistance where cost is a primary concern.
-
-- nemotron_ultra: middle tier, large context window (1M tokens); use for more complex
-  reasoning tasks that need more context than nano but not the full capability of opus.
-
-Respond with only a JSON object of the exact form {"decision": {"target": "<name>"}},
-where <name> is one of: gpt_strong, claude_opus, nemotron_nano, nemotron_ultra.
-Add no other keys and no text outside the JSON object.
-"""
-
-response_schema = '''
-{
-  "type": "object",
-  "properties": {
-    "decision": {
-      "type": "object",
-      "properties": {
-        "target": {
-          "type": "string",
-          "enum": ["gpt_strong", "claude_opus", "nemotron_nano", "nemotron_ultra"]
-        }
-      },
-      "required": ["target"],
-      "additionalProperties": false
-    }
-  },
-  "required": ["decision"],
-  "additionalProperties": false
-}
-'''
-[routes.auto_cheap_vs_expensive.policy]
-type = "target_selector"
-selector = "/decision/target"
 
 [routes.auto]
 id = "auto"

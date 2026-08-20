@@ -30,6 +30,7 @@ pub use algorithms::util::classifier_contract::{
 pub use algorithms::util::escalation::EscalationJudgeConfig;
 pub use algorithms::util::prompts::{SystemPromptProcessor, TargetPrompts, append_note};
 pub use algorithms::util::subagent::SubagentOverride;
+pub use algorithms::util::target_selector::LearnedTargetStat;
 pub use algorithms::util::thompson::{ThompsonSampler, estimate_request_tokens, token_bucket};
 pub use algorithms::util::tool_signals::{DEFAULT_RECENT_WINDOW, ToolSignals};
 
