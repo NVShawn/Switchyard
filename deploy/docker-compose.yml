@@ -16,7 +16,7 @@ services:
   switchyard:
     build:
       context: ..
-      dockerfile: benchmark/switchyard-rust-server.Dockerfile
+      dockerfile: Dockerfile
     image: switchyard-server:local
     container_name: switchyard
     restart: unless-stopped
