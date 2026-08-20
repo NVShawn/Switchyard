@@ -352,6 +352,152 @@ def write_learned_weights(path: Path, weights: list[TargetWeight]) -> None:
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
+@dataclass(frozen=True)
+class ClassifierSample:
+    """One training sample: the request text and its observed-best target label.
+
+    `best_target` is the label with the highest posterior-mean reward among the
+    targets observed for this task. `stats` records the per-target Beta mean and
+    call count that produced the choice, so the dataset stays auditable offline.
+    """
+
+    task: str
+    best_target: str
+    stats: dict[str, tuple[int, float]]
+
+
+def build_classifier_dataset(
+    records: list[dict[str, Any]], model_to_label: dict[str, str]
+) -> list[ClassifierSample]:
+    """Build (request text -> best target) samples from rewarded answer calls.
+
+    For each task the best target is the label with the highest posterior-mean
+    reward (`(sum_reward + 1) / (count + 2)`), matching the server's learned
+    ranking key. Classifier calls, reward-less records, and records without a task
+    header are skipped: they cannot supply a labeled example. Ties break on label
+    order so the label is deterministic.
+    """
+    per_task: dict[str, dict[str, tuple[int, float]]] = {}
+    for record in records:
+        reward = record.get("reward")
+        model = record.get("model")
+        task = record.get("task")
+        if reward is None or not model or not task:
+            continue
+        if record.get("tier") == _CLASSIFIER_TIER:
+            continue
+        label = model_to_label.get(model, model)
+        target_totals = per_task.setdefault(task, {})
+        count, sum_reward = target_totals.get(label, (0, 0.0))
+        target_totals[label] = (count + 1, sum_reward + float(reward))
+    samples = []
+    for task in sorted(per_task):
+        stats = per_task[task]
+
+        def mean(entry: tuple[int, float]) -> float:
+            count, sum_reward = entry
+            return (sum_reward + 1.0) / (count + 2.0)
+
+        best_target = max(sorted(stats), key=lambda label: mean(stats[label]))
+        samples.append(ClassifierSample(task, best_target, stats))
+    return samples
+
+
+def write_classifier_dataset(path: Path, samples: list[ClassifierSample]) -> None:
+    """Write the classifier dataset as JSONL of `{text, target, stats}` rows.
+
+    `stats` carries the per-target `count`, `sum_reward`, and posterior `mean`
+    that justified the label, keeping the emitted dataset self-describing.
+    """
+    lines = []
+    for sample in samples:
+        stats = {
+            label: {
+                "count": count,
+                "sum_reward": sum_reward,
+                "mean": (sum_reward + 1.0) / (count + 2.0),
+            }
+            for label, (count, sum_reward) in sorted(sample.stats.items())
+        }
+        lines.append(
+            json.dumps({"text": sample.task, "target": sample.best_target, "stats": stats})
+        )
+    Path(path).write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def _classifier_prompt(weights: list[TargetWeight]) -> str:
+    """Compose a tuned classifier prompt that embeds observed per-target rewards.
+
+    The prompt lists each target's posterior-mean reward, descending, so the
+    classifier prefers the target with the highest observed reward. Targets are
+    restricted to the labels actually observed offline.
+    """
+    ranked = sorted(weights, key=lambda w: w.mean, reverse=True)
+    lines = [
+        "Select the backend best suited to the request.",
+        "",
+        "Observed mean reward per target (higher is better), learned offline from",
+        "past routing outcomes:",
+        "",
+    ]
+    for weight in ranked:
+        lines.append(f"- {weight.label}: mean_reward={weight.mean:.3f}")
+    labels = ", ".join(w.label for w in ranked)
+    lines.extend(
+        [
+            "",
+            "Prefer the target with the highest observed mean reward that still fits the",
+            "request. Respond with only a JSON object of the exact form",
+            '{"decision": {"target": "<name>"}}, where <name> is one of: ' + labels + ".",
+            "Add no other keys and no text outside the JSON object.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _classifier_schema(weights: list[TargetWeight]) -> str:
+    """Emit a tightened response schema whose enum is only the observed targets."""
+    enum = [w.label for w in sorted(weights, key=lambda w: w.mean, reverse=True)]
+    schema = {
+        "type": "object",
+        "properties": {
+            "decision": {
+                "type": "object",
+                "properties": {"target": {"type": "string", "enum": enum}},
+                "required": ["target"],
+                "additionalProperties": False,
+            }
+        },
+        "required": ["decision"],
+        "additionalProperties": False,
+    }
+    return json.dumps(schema, indent=2)
+
+
+def write_classifier_route(path: Path, weights: list[TargetWeight]) -> None:
+    """Write a `[routes.auto]`-scoped classifier prompt/schema TOML artifact.
+
+    The artifact holds a `prompt` tuned with observed per-target rewards and a
+    `response_schema` whose enum is tightened to the observed targets, both usable
+    by the existing custom `target_selector` route on `routes.auto`.
+    """
+    prompt = _classifier_prompt(weights)
+    schema = _classifier_schema(weights)
+    lines = [
+        "[routes.auto]",
+        "prompt = " + _toml_multiline(prompt),
+        "response_schema = " + _toml_multiline(schema),
+        "",
+    ]
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
+def _toml_multiline(text: str) -> str:
+    """Render a string as a TOML basic multiline literal, escaping backslashes and quotes."""
+    escaped = text.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
+    return '"""\n' + escaped + '\n"""'
+
+
 def _build_run_bundle(*, log_path: Path, out_path: Path) -> Path:
     out_path = out_path.resolve()
     parent = out_path.parent
@@ -406,6 +552,18 @@ def cmd_dream(args: argparse.Namespace) -> Path:
         print(f"wrote {len(weights)} learned target weights to {args.emit_weights}")
         if best is not None:
             print(f"learned best target: {best.label} (mean_reward={best.mean:.3f})")
+
+    if getattr(args, "emit_classifier", None):
+        model_to_label = parse_label_map(args.label)
+        samples = build_classifier_dataset(records, model_to_label)
+        weights = learned_target_weights(records, model_to_label)
+        write_classifier_dataset(bundle_dir / "classifier_dataset.jsonl", samples)
+        write_classifier_route(args.emit_classifier, weights)
+        write_classifier_route(bundle_dir / "classifier_route.toml", weights)
+        print(
+            f"wrote {len(samples)} classifier samples and a tuned prompt over "
+            f"{len(weights)} targets to {args.emit_classifier}"
+        )
 
     mine = args.mine or args.emit_skills or args.emit_tools
     if mine:

@@ -24,8 +24,12 @@ def _label_mapping(value: str) -> str:
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if getattr(args, "label", []) and getattr(args, "emit_weights", None) is None:
-        parser.error("--label-map requires --emit-weights")
+    if (
+        getattr(args, "label", [])
+        and getattr(args, "emit_weights", None) is None
+        and getattr(args, "emit_classifier", None) is None
+    ):
+        parser.error("--label-map requires --emit-weights or --emit-classifier")
 
 
 def _add_launch_parser(
@@ -116,6 +120,16 @@ def _add_dream_parser(
         help=(
             "Write learned-selection TOML weights to PATH from rewarded answer calls. "
             "Use the file on a custom llm_classifier target_selector route."
+        ),
+    )
+    dream.add_argument(
+        "--emit-classifier",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Write a tuned classifier prompt/schema TOML artifact to PATH from rewarded "
+            "answer calls, plus a bundle-local (text -> best target) dataset. Overlay the "
+            "file on the routes.auto custom llm_classifier target_selector route."
         ),
     )
     dream.add_argument(

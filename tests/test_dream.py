@@ -11,6 +11,7 @@ import pytest
 from switchyard.cli.switchyard_cli import _build_parser, _validate_args
 from switchyard.dream import (
     brier_score,
+    build_classifier_dataset,
     cheap_wrong_rate,
     emit_labels,
     judge_calibration,
@@ -19,6 +20,8 @@ from switchyard.dream import (
     read_records,
     summarize_arms,
     teacher_calibration,
+    write_classifier_dataset,
+    write_classifier_route,
     write_learned_weights,
 )
 from switchyard.dream_mining import (
@@ -360,3 +363,91 @@ def test_write_mining_artifacts_emits_versioned_drafts(tmp_path: Path) -> None:
     tool = next((tmp_path / "generated_tools").glob("*.json"))
     assert "version: 1" in skill.read_text()
     assert json.loads(tool.read_text())["version"] == 1
+
+
+def test_build_classifier_dataset_labels_best_target_per_task() -> None:
+    records = [
+        {"task": "solve X", "model": "model/weak", "reward": 0.0},
+        {"task": "solve X", "model": "model/weak", "reward": 0.0},
+        {"task": "solve X", "model": "model/premium", "reward": 1.0},
+        {"task": "greet", "model": "model/weak", "reward": 1.0},
+        {"task": "greet", "model": "model/premium", "reward": 1.0},
+        {"task": "classifier call", "model": "model/weak", "reward": 1.0, "tier": "classifier"},
+        {"model": "model/weak", "reward": 1.0},
+    ]
+    samples = build_classifier_dataset(
+        records, {"model/weak": "weak", "model/premium": "premium"}
+    )
+
+    by_task = {sample.task: sample for sample in samples}
+    assert set(by_task) == {"solve X", "greet"}
+    assert by_task["solve X"].best_target == "premium"
+    assert by_task["greet"].best_target == "premium"
+    assert by_task["solve X"].stats["weak"] == (2, 0.0)
+
+
+def test_write_classifier_dataset_emits_self_describing_jsonl(tmp_path: Path) -> None:
+    samples = build_classifier_dataset(
+        [
+            {"task": "t", "model": "model/weak", "reward": 0.0},
+            {"task": "t", "model": "model/premium", "reward": 1.0},
+        ],
+        {"model/weak": "weak", "model/premium": "premium"},
+    )
+    out = tmp_path / "classifier_dataset.jsonl"
+    write_classifier_dataset(out, samples)
+
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert rows == [
+        {
+            "text": "t",
+            "target": "premium",
+            "stats": {
+                "premium": {"count": 1, "sum_reward": 1.0, "mean": 2.0 / 3.0},
+                "weak": {"count": 1, "sum_reward": 0.0, "mean": 1.0 / 3.0},
+            },
+        }
+    ]
+
+
+def test_write_classifier_route_tunes_prompt_and_tightens_schema(tmp_path: Path) -> None:
+    weights = learned_target_weights(
+        [
+            {"model": "model/weak", "reward": 0.0},
+            {"model": "model/weak", "reward": 0.0},
+            {"model": "model/premium", "reward": 1.0},
+            {"model": "model/premium", "reward": 1.0},
+        ],
+        {"model/weak": "weak", "model/premium": "premium"},
+    )
+    out = tmp_path / "classifier_route.toml"
+    write_classifier_route(out, weights)
+
+    import tomllib
+
+    parsed = tomllib.loads(out.read_text())
+    prompt = parsed["routes"]["auto"]["prompt"]
+    assert "mean_reward" in prompt
+    assert prompt.index("premium: mean_reward") < prompt.index("weak: mean_reward")
+
+    schema = json.loads(parsed["routes"]["auto"]["response_schema"])
+    enum = schema["properties"]["decision"]["properties"]["target"]["enum"]
+    assert enum == ["premium", "weak"]
+    assert schema["properties"]["decision"]["additionalProperties"] is False
+
+
+def test_dream_cli_exposes_emit_classifier_flag(tmp_path: Path) -> None:
+    args = _build_parser().parse_args(
+        [
+            "dream",
+            "--log",
+            str(tmp_path / "routing.jsonl"),
+            "--emit-classifier",
+            str(tmp_path / "classifier_route.toml"),
+            "--label-map",
+            "weak=model/weak",
+        ]
+    )
+    assert args.emit_classifier == tmp_path / "classifier_route.toml"
+    parser = _build_parser()
+    _validate_args(parser, args)
