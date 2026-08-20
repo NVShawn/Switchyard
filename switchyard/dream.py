@@ -601,8 +601,15 @@ def cmd_dream(args: argparse.Namespace) -> Path:
 
 
 def cmd_dream_ui(args: argparse.Namespace) -> None:
-    """Run the dream step and serve a local web UI to explore the results."""
+    """Run the dream step, then serve the local web UI only when ``--ui`` is set.
+
+    Without ``--ui`` this runs the batch dream step and returns, so scheduled
+    (cron) invocations terminate instead of blocking on a long-lived server.
+    """
     bundle_dir = cmd_dream(args)
+
+    if not args.ui:
+        return
 
     from switchyard.cli.dream_ui import serve_dream_ui
 

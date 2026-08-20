@@ -360,6 +360,12 @@ pub struct InputCacheUsage {
     pub cached_input_tokens: Option<u64>,
     /// Input tokens written into a provider cache.
     pub cache_creation_input_tokens: Option<u64>,
+    /// Exact call cost in USD as reported by the upstream (for example the
+    /// LiteLLM `x-litellm-response-cost` header). Kept in the boxed cache detail
+    /// so the common `Usage` allocation stays small; when present it is the
+    /// authoritative cost and is preferred over any per-token estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_cost_usd: Option<f64>,
 }
 
 impl Usage {
@@ -374,6 +380,7 @@ impl Usage {
         Some(Box::new(InputCacheUsage {
             cached_input_tokens,
             cache_creation_input_tokens,
+            reported_cost_usd: None,
         }))
     }
 
@@ -403,6 +410,20 @@ impl Usage {
         self.cache
             .get_or_insert_with(|| Box::new(InputCacheUsage::default()))
             .cache_creation_input_tokens = Some(value);
+    }
+
+    /// Returns the upstream-reported exact call cost in USD, when present.
+    pub fn reported_cost_usd(&self) -> Option<f64> {
+        self.cache
+            .as_ref()
+            .and_then(|cache| cache.reported_cost_usd)
+    }
+
+    /// Sets the upstream-reported call cost, allocating cache detail when needed.
+    pub fn set_reported_cost_usd(&mut self, value: f64) {
+        self.cache
+            .get_or_insert_with(|| Box::new(InputCacheUsage::default()))
+            .reported_cost_usd = Some(value);
     }
 
     /// Every reported input token: non-cached, cache-read, and cache-written.

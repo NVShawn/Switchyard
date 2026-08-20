@@ -215,7 +215,12 @@ async fn upstream_chat(
     } else {
         "ok"
     };
-    Json(json!({
+    let reports_cost = body["messages"].as_array().is_some_and(|messages| {
+        messages
+            .iter()
+            .any(|message| message["content"].as_str() == Some("report-cost"))
+    });
+    let response = Json(json!({
         "id": "chatcmpl-test",
         "object": "chat.completion",
         "model": model,
@@ -230,8 +235,13 @@ async fn upstream_chat(
             "total_tokens": 12,
             "prompt_tokens_details": {"cached_tokens": 7}
         }
-    }))
-    .into_response()
+    }));
+    if reports_cost {
+        // Exercises the upstream-reported cost path: the server must log this
+        // exact value instead of the per-token estimate.
+        return ([("x-litellm-response-cost", "0.004200")], response).into_response();
+    }
+    response.into_response()
 }
 
 async fn upstream_messages_requires_forwarded_oauth(
@@ -1813,6 +1823,22 @@ target = "openai"
     ))?;
     let app = build_switchyard_router(state);
 
+    let missing = send(
+        &app,
+        "POST",
+        "/v1/responses",
+        Some(json!({"model": "switchyard/codex", "input": "hello"})),
+    )
+    .await?;
+    assert_eq!(missing.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(missing.json()?["error"]["code"], "missing_external_auth");
+    assert!(upstream.calls.lock().await.is_empty());
+
+    let models = send(&app, "GET", "/v1/models", None).await?.json()?;
+    assert_eq!(models["data"][0]["requires_external_auth"], true);
+    assert_eq!(models["data"][0]["external_auth_kind"], "openai");
+    assert_eq!(models["models"][0]["requires_external_auth"], true);
+
     let response = send_with_headers(
         &app,
         "POST",
@@ -2257,6 +2283,12 @@ async fn routing_log_prefers_canonical_and_preserves_legacy_fallback() -> TestRe
     let first: Value =
         serde_json::from_str(records.lines().next().ok_or("routing log was empty")?)?;
     assert_eq!(first["session_id"], "canonical-session");
+    assert_eq!(first["route_id"], ROUTE_MODEL);
+    assert!(
+        first["request_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
     assert!(
         first["ts"]
             .as_str()
@@ -2290,7 +2322,7 @@ async fn transcript_log_records_normalized_request_and_response() -> TestResult 
 
     // Transcript writes are asynchronous (background writer thread); poll until
     // both expected events are durable or the deadline passes.
-    let events = poll_transcript_events(&transcript_path, 2).await?;
+    let events = poll_transcript_events(&transcript_path, "normalized_response").await?;
 
     let kinds: Vec<&str> = events
         .iter()
@@ -2314,9 +2346,11 @@ async fn transcript_log_records_normalized_request_and_response() -> TestResult 
     Ok(())
 }
 
-/// Polls the transcript file until it holds at least `expected` parseable events
-/// or a short deadline elapses, tolerating the asynchronous background writer.
-async fn poll_transcript_events(path: &std::path::Path, expected: usize) -> TestResult<Vec<Value>> {
+/// Polls until `expected_event` is durable, tolerating the background writer.
+async fn poll_transcript_events(
+    path: &std::path::Path,
+    expected_event: &str,
+) -> TestResult<Vec<Value>> {
     for _ in 0..100 {
         if let Ok(contents) = std::fs::read_to_string(path) {
             let events: Vec<Value> = contents
@@ -2324,13 +2358,16 @@ async fn poll_transcript_events(path: &std::path::Path, expected: usize) -> Test
                 .filter(|line| !line.trim().is_empty())
                 .filter_map(|line| serde_json::from_str(line).ok())
                 .collect();
-            if events.len() >= expected {
+            if events
+                .iter()
+                .any(|event| event["event"].as_str() == Some(expected_event))
+            {
                 return Ok(events);
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    Err("transcript did not reach the expected event count".into())
+    Err("transcript did not reach the expected event".into())
 }
 
 /// A capability ladder with per-rung pricing, built from a TOML deployment so the
@@ -2429,6 +2466,66 @@ capability_targets = [
         .ok_or("no judge record")?;
     // The judge call is not a bandit arm, so it carries no reward.
     assert!(judge.get("reward").is_none() || judge["reward"].is_null());
+    Ok(())
+}
+
+/// The upstream's `x-litellm-response-cost` header is authoritative: the routing
+/// record logs it verbatim instead of the configured per-token estimate.
+#[tokio::test]
+async fn a_routed_call_prefers_the_upstream_reported_cost() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config_path = temp_dir.path().join("routes.toml");
+    let log_path = temp_dir.path().join("routing.jsonl");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "{}"
+
+[targets.nano]
+id = "model/nano"
+llm_client = "primary"
+cost = {{ input_per_1m = 0.10, output_per_1m = 0.10 }}
+
+[routes.direct]
+id = "switchyard/direct"
+type = "passthrough"
+target = "nano"
+"#,
+            upstream.base_url
+        ),
+    )?;
+    let state = load_server_state(&config_path)?.with_routing_log(&log_path)?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": "switchyard/direct",
+            "messages": [{"role": "user", "content": "report-cost"}]
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    let records = std::fs::read_to_string(&log_path)?;
+    let answer = records
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|record| record["tier"] != "classifier")
+        .ok_or("no answer record")?;
+    // The header (0.0042) wins over the per-token estimate (10+2 tokens at
+    // 0.10/1M would be ~0.0000012), proving the reported cost is preferred.
+    assert_eq!(answer["cost_usd"].as_f64(), Some(0.0042));
     Ok(())
 }
 

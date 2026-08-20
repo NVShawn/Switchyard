@@ -14,7 +14,8 @@ use reqwest::RequestBuilder;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::{Map, Value};
 use switchyard_protocol::{
-    LlmRequest, LlmResponse, Metadata, ModelId, Request, Response, RoutedLlmClient,
+    LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, Metadata,
+    ModelId, Request, Response, RoutedLlmClient,
 };
 use switchyard_translation::{
     TranslationPolicy, WireFormat, decode_aggregated_response, decode_request, decode_stream,
@@ -178,7 +179,7 @@ impl TranslatingLlmClient {
             .await?;
         let body = match http_response {
             EncodedResponse::Buffered { body, .. } => body,
-            EncodedResponse::Streaming(_) => {
+            EncodedResponse::Streaming { .. } => {
                 return Err(LlmClientError::InvalidRequest {
                     message: "count_tokens does not support streaming requests".to_string(),
                 });
@@ -326,10 +327,14 @@ impl TranslatingLlmClient {
         };
         let status = response.status();
         if status.is_success() {
+            let reported_cost_usd = parse_reported_cost(response.headers());
             if streaming {
                 // Streaming body failures happen after the retry boundary.
                 metrics::record_upstream_attempt(Some(status.as_u16()));
-                return Ok(EncodedResponse::Streaming(response));
+                return Ok(EncodedResponse::Streaming {
+                    response,
+                    reported_cost_usd,
+                });
             }
             let body = match response.bytes().await {
                 Ok(body) => body,
@@ -346,6 +351,7 @@ impl TranslatingLlmClient {
             return Ok(EncodedResponse::Buffered {
                 status: status.as_u16(),
                 body: body.to_vec(),
+                reported_cost_usd,
             });
         }
 
@@ -433,7 +439,10 @@ impl TranslatingLlmClient {
             .await?;
 
         let llm_response = match http_response {
-            EncodedResponse::Streaming(http_response) => {
+            EncodedResponse::Streaming {
+                response: http_response,
+                reported_cost_usd,
+            } => {
                 // Adapt the reqwest body stream to plain bytes; the SSE-decode itself is
                 // transport-agnostic and lives in `switchyard-translation`.
                 let bytes = http_response.bytes_stream().map(|chunk| {
@@ -450,14 +459,23 @@ impl TranslatingLlmClient {
                     })
                 });
                 let chunks = decode_stream(bytes, wire_format)?;
-                LlmResponse::Stream(chunks)
+                // Stamp the upstream-reported cost onto the stream's usage event so
+                // the downstream observer records the exact cost, not an estimate.
+                LlmResponse::Stream(attach_reported_cost(chunks, reported_cost_usd))
             }
-            EncodedResponse::Buffered { body, .. } => {
+            EncodedResponse::Buffered {
+                body,
+                reported_cost_usd,
+                ..
+            } => {
                 let body = serde_json::from_slice::<Value>(&body).map_err(|error| {
                     LlmClientError::ResponseTranslation(format!("invalid upstream JSON: {error}"))
                 })?;
-                let agg = decode_aggregated_response(&body, wire_format)
+                let mut agg = decode_aggregated_response(&body, wire_format)
                     .map_err(|error| LlmClientError::ResponseTranslation(error.to_string()))?;
+                if let Some(cost) = reported_cost_usd {
+                    agg.usage.set_reported_cost_usd(cost);
+                }
                 LlmResponse::Agg(agg)
             }
         };
@@ -556,17 +574,89 @@ impl UpstreamEndpoint {
 }
 
 enum EncodedResponse {
-    Buffered { status: u16, body: Vec<u8> },
-    Streaming(reqwest::Response),
+    Buffered {
+        status: u16,
+        body: Vec<u8>,
+        reported_cost_usd: Option<f64>,
+    },
+    Streaming {
+        response: reqwest::Response,
+        reported_cost_usd: Option<f64>,
+    },
 }
 
 impl EncodedResponse {
     fn status(&self) -> u16 {
         match self {
             EncodedResponse::Buffered { status, .. } => *status,
-            EncodedResponse::Streaming(response) => response.status().as_u16(),
+            EncodedResponse::Streaming { response, .. } => response.status().as_u16(),
         }
     }
+}
+
+// Reads the upstream-reported exact call cost, preferring the customer-facing
+// `x-litellm-response-cost` and falling back to the pre-discount original. Both
+// are USD floats; a missing or unparseable header yields `None`.
+fn parse_reported_cost(headers: &HeaderMap) -> Option<f64> {
+    for name in [
+        "x-litellm-response-cost",
+        "x-litellm-response-cost-original",
+    ] {
+        if let Some(cost) = headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|cost| cost.is_finite() && *cost >= 0.0)
+        {
+            return Some(cost);
+        }
+    }
+    None
+}
+
+// Stamps the upstream-reported cost onto the stream's terminal usage chunk.
+//
+// The cost arrives in a response header, not the SSE body, so it must be merged
+// into the normalized `Usage` chunk here. Provider replay data (`preservation`)
+// is retained so same-format streaming passthrough re-encodes unchanged; only
+// the neutral usage the server observes gains the cost. When no cost is reported
+// the stream is returned untouched.
+fn attach_reported_cost(
+    stream: LlmResponseStream,
+    reported_cost_usd: Option<f64>,
+) -> LlmResponseStream {
+    let Some(cost) = reported_cost_usd else {
+        return stream;
+    };
+    Box::pin(stream.map(move |item| {
+        item.map(|event| {
+            if !event
+                .normalized()
+                .iter()
+                .any(|chunk| matches!(chunk, LlmResponseChunk::Usage(_)))
+            {
+                return event;
+            }
+            let (preservation, chunks) = event.into_parts();
+            let chunks = chunks
+                .into_iter()
+                .map(|chunk| match chunk {
+                    LlmResponseChunk::Usage(mut usage) => {
+                        usage.set_reported_cost_usd(cost);
+                        LlmResponseChunk::Usage(usage)
+                    }
+                    other => other,
+                })
+                .collect();
+            match preservation {
+                Some(provider) => {
+                    let (source, raw) = provider.into_parts();
+                    LlmResponseStreamEvent::preserved(source, raw, chunks)
+                }
+                None => LlmResponseStreamEvent::new(chunks),
+            }
+        })
+    }))
 }
 
 // The typed error decides retry eligibility; status and Retry-After feed
@@ -1110,6 +1200,66 @@ mod tests {
         let agg = response.llm_response.into_agg().await?;
         assert_eq!(completion_text(&agg), "Hi there");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn buffered_response_captures_reported_cost_header()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-litellm-response-cost", "0.0007452")
+                    .set_body_json(json!({
+                        "id": "chatcmpl-1",
+                        "model": "gpt",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 16, "completion_tokens": 40, "total_tokens": 56}
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
+        assert_eq!(agg.usage.reported_cost_usd(), Some(0.0007452));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streaming_response_stamps_reported_cost_on_usage_chunk()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        let body = "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+             data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\
+             \"usage\":{\"prompt_tokens\":16,\"completion_tokens\":40,\"total_tokens\":56}}\n\n\
+             data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-litellm-response-cost", "0.00123")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await?;
+        // Folding the stream keeps the last usage chunk, which must carry the cost.
+        let agg = response.llm_response.into_agg().await?;
+        assert_eq!(agg.usage.reported_cost_usd(), Some(0.00123));
         Ok(())
     }
 
